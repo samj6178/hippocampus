@@ -1,7 +1,7 @@
 <!-- HIPPOCAMPUS:BEGIN -->
 # Hippocampus MOS — Learned Knowledge
 
-*Auto-generated: 2026-03-23 20:21 | 18 patterns from 16 topics*
+*Auto-generated: 2026-03-23 21:26 | 16 patterns from 17 topics*
 
 Memory: 77 episodic, 948 semantic
 
@@ -24,30 +24,25 @@ Memory: 77 episodic, 948 semantic
 - Production Readiness Plan COMPLETE. All 9 phases shipped in one session:
 - CRITICAL BUG: Production crash after deploying v0.8 — panic in recall_service.go line 156. Had to rollback immediately. Root cause: nil pointer dereference when embedding provider returned empty vec...
 
-### Go (2 patterns)
+### Go-Compilation (2 patterns)
 
-- ERROR: goroutine leak: http.Client without timeout causes goroutine to hang forever on slow responses
-- CRITICAL BUG: Production crash in hippocampus MCP server. Fatal panic in goroutine during concurrent recall — data race on working memory map. Root cause: missing mutex lock in WorkingMemory.Snapsho...
+- ERROR: MCP binary path mismatch: Cursor starts bin/hippocampus.exe but 'go build' outputs to project root hippocampus.exe
+- ERROR: undefined: app.ContextWriter
 
 ### Architecture (2 patterns)
 
 - ARCHITECTURE UPGRADE SESSION (2026-03-20): Major improvements to hippocampus quality:
 - ARCHITECTURE UPGRADE SESSION (2026-03-20): Transformed hippocampus from memory store to learning system. Changes:
 
-### Embeddings (2 patterns)
-
-- ERROR: import cycle not allowed: embedding imports app imports embedding
-- CRITICAL BUG FIX (2026-03-18): Embeddings were never loaded from DB in SearchSimilar queries. scanEpisodic/scanSemantic/scanProcedural did not SELECT or Scan the embedding column. This caused: 1) cosi...
-
-### Mcp-Protocol (2 patterns)
-
-- ERROR: StoreIfProcedural is called TWICE for every remember/learn_error: once inside EncodeService.Encode() goroutine (line 180-184) and once in MCP handler (toolRemember line 282-288, toolLearnError ...
-- ERROR: MCP binary path mismatch: Cursor starts bin/hippocampus.exe but 'go build' outputs to project root hippocampus.exe
-
 ### General (2 patterns)
 
 - ERROR: LLM reranking with 0.6 LLM weight caused false negatives — relevant query 'how does consolidation work in hippocampus' was rejected as irrelevant
 - ERROR: panic: runtime error: index out of range [3] with length 3
+
+### Go (2 patterns)
+
+- ERROR: goroutine leak: http.Client without timeout causes goroutine to hang forever on slow responses
+- CRITICAL BUG: Production crash in hippocampus MCP server. Fatal panic in goroutine during concurrent recall — data race on working memory map. Root cause: missing mutex lock in WorkingMemory.Snapsho...
 
 ## MCP Integration
 
