@@ -1,0 +1,1 @@
+DROP MATERIALIZED VIEW IF EXISTS episodic_session_summary CASCADE;

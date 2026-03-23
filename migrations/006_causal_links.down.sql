@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS causal_links CASCADE;

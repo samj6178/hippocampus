@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hippocampus": {
+      "command": "d:\\go\\hippocampus\\bin\\hippocampus.exe",
+      "args": ["-config", "d:\\go\\hippocampus\\config.json", "-migrations", "d:\\go\\hippocampus\\migrations"]
+    }
+  }
+}

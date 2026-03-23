@@ -1,0 +1,60 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: hippocampus
+      POSTGRES_USER: mos
+      POSTGRES_PASSWORD: mos
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mos -d hippocampus"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  hippocampus:
+    build: .
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+      - "3000:3000"
+    environment:
+      DATABASE_URL: "postgres://mos:mos@timescaledb:5432/hippocampus?sslmode=disable"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      LOG_LEVEL: "info"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    depends_on:
+      - hippocampus
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: hippocampus
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,61 @@
+---
+description: Auto-generated live context from Hippocampus MOS
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# hippocampus (updated 2026-03-23 20:21)
+
+Memory: 77 episodic, 948 semantic | Use `mos_recall` for deep search, `mos_remember` to store, `mos_session_end` at end
+
+## DO NOT REPEAT THESE MISTAKES
+
+- A/B Testing Framework shipped as mos_ab_test (33rd MCP tool). 12 scenarios across 6 categories (resource_leak, concurrency, injection, error_handling, architecture, protocol). Each scenario has BuggyDiff + CorrectDiff + anti-pattern regex. Two conditions: treatment (warnings ON) vs control (warnings...
+- ERROR: goroutine leak: http.Client without timeout causes goroutine to hang forever on slow responses
+- Production Readiness Plan COMPLETE. All 9 phases shipped in one session:
+- GOTCHA: go/ast parser skips unexported functions by default. When ingesting codebase for memory, only exported symbols are captured. DO: filter with d.Name.IsExported(). DON'T: try to ingest everything - private funcs are noise.
+- BUG: MCP stdio transport uses newline-delimited JSON, NOT Content-Length framing like LSP. CAUSE: copied LSP pattern blindly. FIX: changed to bufio.Scanner + json.Marshal + newline. FILE: internal/adapter/mcp/server.go
+- GOTCHA: TimescaleDB continuous aggregates CANNOT be created inside a transaction. Migration runner wraps everything in tx by default. DO: use @notx marker in migration SQL to execute outside transaction. DON'T: try to wrap CREATE MATERIALIZED VIEW in BEGIN/COMMIT.
+
+## Active Decisions
+
+- DECISION: Use Ollama nomic-embed-text (768-dim) instead of OpenAI embeddings. REASON: zero cost, local inference, no API key dependency, good multilingual support. ALTERNATIVES: OpenAI text-embedding-...
+
+## Knowledge
+
+- Critical bugs in v0.8 release caused data races and nil pointer dereferences, leading to data loss in working memory and session summaries. Performance optimizations included compacting WSL VHDX and relocating model files, freeing up 163.2GB of storage.
+- v0.6-alpha introduced auto-project detection, structured error learning, and context prevention of mistakes, building on v0.5-alpha's 10 MCP tools for project management and automation.
+- Core issues involve timeout settings, import cycles, and package dependencies in the app and embedding services. Solutions include configuring timeouts, refactoring metric definitions, and managing package imports to prevent cycles and ensure proper dependencies.
+- SESSION SUMMARY: v0.9-alpha: Added Research Agent (arxiv/GitHub/HackerNews + Ollama synthesis), Evaluation Framework (Brier score, precision, learning curve), and Benchmark Suite (12 scenarios, 4 categories: error prevention/knowledge recall/semantic match/negative rejection). Benchmark results: F1=1.000 standalone, F1=0.750 real-world. Fixed: binary path mismatch (bin/ vs root), adaptive similarity threshold, spread-based negative rejection. Found competitors: Engram 1543★, psychmem 46★, CraniMem paper. Next: make system actually useful in practice, improve dashboard, paper-worthy evaluation.
+- Added feedback handling and auto-procedural detection in REST API and agent tools, enhancing the learning loop with LLM-assisted reranking and integrating feedback into recall responses.
+- The encode pipeline stores verbose raw text, bypassing summary generation and content quality checks, leading to inefficient use of token budget and potential storage of low-quality content.
+- The system is operational with 28 MCP tools, tracking 4 projects, and using Qwen2.5:7b for learning, with embeddings from nomic-embed-text 768-dim. Competitors include Engram, psychmem, CraniMem, and cass_memory_system, differing in features like prediction engines and consolidation mechanisms.
+- LLM reranking blend ratio set to 0.6*cosine + 0.4*LLM, with a safety floor of average LLM score < 2.0 to discard results, and no modification to SemanticSimilarity field.
+- RULE: Ensure all calls to StoreIfProcedural are consolidated to a single location within EncodeService.Encode() to avoid duplicates.
+- Hippocampus MOS roadmap and architecture vision: v0.1 = vector search (DONE), v0.2 = dependency graph (more precise recall), v0.3 = two-pass orchestrator (decomposition + graph), v1.0 = orchestrator that learns from its mistakes (meta-cognition). Key insight: agents accumulate errors same as knowledge (semantic drift). Solution: consensus-based consolidation — before episodic→semantic promotion, facts must be verified by multiple agents or external sources. Also need: confidence decay for unverified facts, contradiction detection, outcome tracking (success/failure per recall). This is what separates 'smart tool' from 'agent that thinks'. The system that understands where it doesn't understand.
+- Migrated hippocampus from pgx v4 to v5, updating Connect() signature and related repos due to API changes.
+- RULE: Ensure all functions with side effects are idempotent and avoid redundant calls.
+- RULE: Implement comprehensive boundary and index checks in all array access operations.
+- RULE: Ensure all memory writes are idempotent and avoid redundant operations.
+- RULE: Ensure all modifications to shared state or critical paths are atomic and properly synchronized.
+- RULE: DO NOT INCREASE LLM WEIGHT WITHOUT THOROUGH TESTING AND MONITORING.
+- RULE: Implement comprehensive boundary and range checks for array accesses.
+- RULE: Ensure all modifications to shared state or global variables are properly synchronized and checked for race conditions.
+- RULE: Ensure all memory writes are idempotent and controlled by a centralized manager.
+- [global] ERROR in episodic_repo.go: SQL query column order mismatch in ListByTags. The SELECT columns were in wrong order compared to collectEpisodic scan function. Fix: reorder SELECT to match: id, time, project_id, agent_id, session_id, content, summary, importance, confidence, access_count, last_accessed, token_count, tags, metadata, consolidated.
+- [global] ERROR: MCP tools not appearing after code changes. Root cause: Cursor's mcp.json points to bin/hippocampus.exe but build outputs to project root. Cursor caches tool descriptors from first tools/list response. Fix: always build to bin/ directory, kill old process before rebuild, and fully restart Cursor.
+- [global] ARCHITECTURE: Hippocampus follows clean architecture pattern. Layers: domain (entities, ports/interfaces) -> app (use cases, services) -> adapter (MCP server, REST API) -> repo (PostgreSQL/TimescaleDB). Dependencies point inward. Domain has zero external dependencies.
+- [global] CONFIGURATION: Hippocampus uses Ollama with nomic-embed-text model for embeddings. 768 dimensions. Running locally at localhost:11434. OpenAI-compatible API at /v1 endpoint. For LLM synthesis (translation, research), uses qwen2.5:7b via native /api/chat endpoint.
+- [global] DECISION: Use pgx/v5 instead of database/sql for PostgreSQL in Hippocampus. Reasons: native pgvector support for vector similarity search, better connection pooling with pgxpool, full context.Context support, COPY protocol for bulk inserts, and direct access to PostgreSQL-specific features.
+- [global] ERROR in metrics.go: 'undefined: filepath'. Root cause: missing import statement. Fix: add 'path/filepath' to import block. This is a common Go compilation error when using filepath.Join or filepath.Dir without importing the package.
+- [global] CODE CHANGE: recall_service.go — Added llmRerank() method. Sends top-5 candidates to LLM (qwen2.5:7b) for relevance scoring 0-10. Blend: 0.6*cosine + 0.4*LLM normalized. Safety: if avg LLM score < 2.0, discards LLM scores entirely (weak model fallback). SemanticSimilarity field NOT modified — only Composite changes, preserving rejection logic in detectIrrelevantQuery. Timeout: 4s context. Functions added: llmRerank, parseLLMScores. File: internal/app/recall_service.go.
+- [global] CODE FILE: tinder-web/src/quasar.d.ts [typescript]
+
+## Recent
+
+- (3 days ago) PRODUCT QUALITY ROADMAP — priority order for Anthropic-level encode pipeline:
+- (3 days ago) CODE CHANGE: context_writer.go — 3 improvements: 1) Fixed silent error handling: all 5 DB queries (ListByProject, ListGlobal, ListUnconsolidated, Co...
+- (3 days ago) TEST: Claude Code MCP integration test - context_writer evaluation in progress
+- (5 days ago) v1.4 RELEASE RESULTS (2026-03-18): 5 critical fixes applied. (1) IncludeGlobal disabled for project-scoped recall — no more arxiv/cross-project nois...
+- (5 days ago) CODE CHANGE: hippocampus_agent.mdc — Complete rewrite of agent rule. Now mandates: 1) mos_feedback MANDATORY after every recall (skip only if 0 sour...
+

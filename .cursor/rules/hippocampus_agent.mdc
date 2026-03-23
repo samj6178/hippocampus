@@ -1,0 +1,81 @@
+---
+description: Hippocampus MOS — code memory system. Automatic learning loop.
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# Hippocampus MOS Protocol — Automatic Learning
+
+## SESSION START (mandatory)
+```
+mos_init(workspace_path="<workspace root>")
+```
+First time in a project? Also call `mos_study_project()`.
+
+## BEFORE ANY EDIT — load context
+```
+mos_recall(query="<what you're about to do>")
+```
+
+## AFTER EVERY RECALL — give feedback (MANDATORY)
+After using recall results, you MUST report whether they helped:
+```
+mos_feedback(memory_id="<from recall sources>", useful=true/false)
+```
+Pick the most relevant source from recall and report. This is how the system learns.
+Skip ONLY if recall returned 0 sources.
+
+## AFTER EVERY CODE CHANGE — remember (MANDATORY)
+```
+mos_remember(
+  content="CODE CHANGE: <file> — <what+why>. Functions: <names>. Deps: <affected>.",
+  importance=0.85,
+  tags=["code_change", "<component>"]
+)
+```
+
+## AFTER EVERY ERROR — learn (MANDATORY)
+```
+mos_learn_error(error_message="...", root_cause="...", fix="...", file_path="...")
+```
+
+## AFTER EVERY DECISION — remember
+```
+mos_remember(content="DECISION: <what> because <why>. Alternatives: <rejected>.", importance=0.85, tags=["decision"])
+```
+
+## AFTER SUCCESSFUL WORKFLOW — track outcome
+When a multi-step task completes successfully (deploy, debug, refactor, migration):
+```
+mos_track_outcome(description="<what workflow>: 1) step 2) step 3) step", success=true)
+```
+This builds procedural memory — the system learns HOW to do things.
+
+## COMPLEX QUESTIONS — fuse knowledge (PRIORITY)
+1. Do your web search first
+2. Pass findings + query to mos_fuse:
+```
+mos_fuse(query="...", external_evidence=["web result 1", "web result 2"], rerank=true)
+```
+
+## SESSION END
+```
+mos_session_end(summary="<what changed, decisions made, next steps>")
+```
+
+## AUTOMATIC BEHAVIORS — no user action needed
+- mos_init: auto on session start
+- mos_remember: auto after every code change
+- mos_learn_error: auto on every error
+- mos_feedback: auto after every recall
+- mos_track_outcome: auto after multi-step success
+- mos_session_end: auto when conversation ends
+
+## The Learning Loop
+```
+recall -> use -> feedback -> improve scoring
+remember -> consolidate -> better future recalls
+error -> learn -> prevent -> save time
+workflow -> track -> procedural -> reusable knowledge
+```
+Without feedback, the system cannot learn. Without remember, it forgets.

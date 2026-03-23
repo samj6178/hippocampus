@@ -1,0 +1,18 @@
+# Learned Patterns: Api-Design
+
+Auto-generated from 2 incidents in hippocampus.
+
+## 1. ERROR: StoreIfProcedural is called TWICE for every remember/learn_error: once inside EncodeService.Encode() goroutine (line 180-184) and once in MCP handler (toolRemember line 282-288, toolLearnError line 209). This creates duplicate procedural memories.
+CONTEXT: Deep analysis of encode pipeline quality
+ROOT CAUSE: Procedural detection was added in two places independently — in the encode service as a generic feature, and in MCP handlers as a specific enhancement. Neither checked if the other already does it.
+FIX: Remove StoreIfProcedural calls from MCP handlers (handlers.go). Keep only the one in EncodeService.Encode() which is the canonical encode path.
+PREVENTION: Single responsibility: procedural detection belongs in EncodeService only. MCP handlers should never duplicate logic that exists in the service layer.
+FILE: internal/adapter/mcp/handlers.go, internal/app/encode_service.go
+
+## 2. ERROR: undefined: app.ContextWriter
+CONTEXT: Adding context writer to REST server
+ROOT CAUSE: Forgot to import the app package after restructuring the REST server
+FIX: Added context writer as dependency to rest.Server struct and NewServer constructor
+PREVENTION: When adding new dependencies to any server struct, always update both struct definition and constructor
+FILE: internal/adapter/rest/router.go
+

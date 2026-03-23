@@ -1,0 +1,639 @@
+# Universal Software Architecture Standard
+# Универсальный стандарт архитектуры ПО — для любого проекта, любого домена
+# Уровень: Senior+ / Tech Lead / Staff Engineer
+
+---
+
+## ФИЛОСОФИЯ
+
+Код пишется один раз, читается сто раз, дебажится в 3 часа ночи.
+Архитектура — это НЕ про файловую структуру. Это про стоимость изменения.
+Хорошая архитектура = дешёвое изменение. Плохая = каждая фича ломает три других.
+
+Три главных вопроса перед написанием любого кода:
+1. Где я буду это менять через 6 месяцев?
+2. Как я это протестирую без поднятия всей инфраструктуры?
+3. Что сломается если я это удалю?
+
+---
+
+## ПРИНЦИП 1: BOUNDARIES — Границы важнее кода
+
+Код внутри границ можно переписать за день. Границы переделать — за месяц.
+
+### Три слоя (минимум для любого проекта):.
+
+```
+┌─────────────────────────────────────────────────┐
+│  TRANSPORT (adapter/handler)                     │
+│  HTTP, gRPC, CLI, MQTT, WebSocket, Cron, Queue  │
+│  Парсит вход → вызывает сервис → форматирует    │
+│  выход. НЕ содержит логику. ≤30 строк.          │
+└──────────────────────┬──────────────────────────┘
+                       │ вызывает (interface)
+┌──────────────────────▼──────────────────────────┐
+│  DOMAIN / APPLICATION (service/usecase)          │
+│  Бизнес-правила. Оркестрация. Валидация.         │
+│  НЕ знает про HTTP/SQL/Kafka/JSON.               │
+│  Зависит ТОЛЬКО от интерфейсов.                  │
+└──────────────────────┬──────────────────────────┘
+                       │ вызывает (interface)
+┌──────────────────────▼──────────────────────────┐
+│  INFRASTRUCTURE (repo/client/gateway)            │
+│  SQL, Redis, S3, внешние API, файловая система.  │
+│  Реализует интерфейсы, определённые доменом.     │
+│  SQL — ТОЛЬКО тут. HTTP-клиенты — ТОЛЬКО тут.    │
+└─────────────────────────────────────────────────┘
+```
+
+### Правило зависимостей:
+```
+Transport → Domain ← Infrastructure
+              ↑
+         НЕ знает
+       откуда данные
+       и куда ответ
+```
+
+Domain НИКОГДА не импортирует Transport или Infrastructure.
+Transport НИКОГДА не импортирует Infrastructure напрямую.
+Infrastructure НИКОГДА не импортирует Transport.
+
+Нарушил — получил монолит с circular dependencies через 3 месяца.
+
+---
+
+## ПРИНЦИП 2: SINGLE RESPONSIBILITY — Один файл, одна причина для изменения
+
+### Диагностика God Object:
+- Struct имеет >8 полей → разбей
+- Struct имеет >10 методов → разбей
+- Файл >500 строк → разбей
+- Метод использует <30% полей struct → он принадлежит другому struct
+- Ты не можешь описать ответственность файла в 5 словах → разбей
+
+### Диагностика God File:
+- main.go > 150 строк → вынеси инициализацию, роуты, хендлеры
+- Один JS/TS файл > 500 строк → разбей на модули
+- Один CSS файл > 2000 строк → разбей на base + theme + components
+- Один SQL файл с DDL и DML → разбей на миграции
+
+### Правило декомпозиции:
+```
+НЕ "как мне разбить 2000-строчный файл?"
+А  "сколько ПРИЧИН у этого файла быть изменённым?"
+
+Причина 1: Изменился API контракт → handler
+Причина 2: Изменилась бизнес-логика → service
+Причина 3: Изменилась схема БД → repo
+Причина 4: Изменился формат логов → logger
+
+4 причины = минимум 4 файла.
+```
+
+---
+
+## ПРИНЦИП 3: DEPENDENCY INJECTION — Тестируемость по умолчанию
+
+### Правило: если struct нельзя протестировать за 5 секунд без Docker — архитектура сломана.
+
+```go
+// ПЛОХО: жёсткая связанность
+type OrderService struct {
+    db    *sql.DB              // нужна реальная БД для теста
+    redis *redis.Client        // нужен реальный Redis
+    smtp  *gomail.Dialer       // нужен реальный SMTP
+}
+
+// ХОРОШО: зависимости через интерфейсы
+type OrderService struct {
+    orders OrderRepo           // interface
+    cache  CacheStore          // interface
+    notify Notifier            // interface
+}
+
+// Тест за 5 строк:
+func TestCreateOrder(t *testing.T) {
+    svc := NewOrderService(&mockOrderRepo{}, &mockCache{}, &mockNotifier{})
+    order, err := svc.Create(ctx, req)
+    assert.NoError(t, err)
+    assert.Equal(t, "pending", order.Status)
+}
+```
+
+### Правила интерфейсов:
+1. **Определяет потребитель, не провайдер.** OrderService определяет OrderRepo, не пакет postgres.
+2. **Маленькие > большие.** 1-3 метода. `io.Reader` (1 метод) > `DatabaseClient` (40 методов).
+3. **Называй по поведению, не по реализации.** `Notifier`, не `SMTPClient`. `OrderRepo`, не `PostgresOrderStorage`.
+4. **Не абстрагируй без причины.** Если реализация одна и никогда не будет другой — не делай интерфейс.
+
+### Правило конструктора:
+```go
+// Все зависимости — через конструктор. Явно. Без магии.
+func NewOrderService(repo OrderRepo, cache CacheStore, notify Notifier, logger *slog.Logger) *OrderService {
+    return &OrderService{repo: repo, cache: cache, notify: notify, logger: logger}
+}
+
+// НИКОГДА: global state, init(), singleton через sync.Once для бизнес-логики
+// Допустимо: singleton для logger, config (read-only after init)
+```
+
+---
+
+## ПРИНЦИП 4: ERROR HANDLING — Цепочка, а не дерево
+
+### Три уровня обработки ошибок:
+
+```
+Уровень 1 (Infrastructure): Оборачивай с контекстом
+    return fmt.Errorf("insert order id=%s: %w", id, err)
+
+Уровень 2 (Domain/Service): Оборачивай или трансформируй
+    return fmt.Errorf("create order: %w", err)
+    ИЛИ
+    if errors.Is(err, sql.ErrNoRows) {
+        return ErrOrderNotFound  // доменная ошибка
+    }
+
+Уровень 3 (Transport/Handler): Логируй + ответ клиенту
+    logger.Error("create order failed", "err", err, "user_id", userID)
+    respond(w, 500, "internal error")  // БЕЗ деталей клиенту
+```
+
+### Правила:
+1. **Никогда не логируй И не возвращай ошибку одновременно.** Либо-либо.
+2. **Логируй один раз на верхнем уровне.** Не 3 раза на 3 слоях.
+3. **Клиент получает общее сообщение.** "internal error", не "pq: duplicate key violates unique constraint".
+4. **Доменные ошибки — это тип, не строка:**
+```go
+var (
+    ErrNotFound     = errors.New("not found")
+    ErrConflict     = errors.New("conflict")
+    ErrUnauthorized = errors.New("unauthorized")
+    ErrValidation   = errors.New("validation failed")
+)
+
+// Handler маппит доменные ошибки в HTTP коды:
+func mapError(err error) int {
+    switch {
+    case errors.Is(err, domain.ErrNotFound):     return 404
+    case errors.Is(err, domain.ErrConflict):     return 409
+    case errors.Is(err, domain.ErrUnauthorized): return 401
+    case errors.Is(err, domain.ErrValidation):   return 400
+    default:                                      return 500
+    }
+}
+```
+
+---
+
+## ПРИНЦИП 5: КОНФИГУРАЦИЯ — Fail Fast, Secrets in Env
+
+### Иерархия источников (по приоритету):
+```
+1. CLI flags          (--port 8080)           ← highest priority
+2. Environment vars   (PORT=8080)
+3. Config file        (config.yaml: port: 8080)
+4. Defaults           (const defaultPort = 8080) ← lowest priority
+```
+
+### Правила:
+1. **Секреты — ТОЛЬКО env.** Пароли, токены, ключи шифрования — никогда в файлах, никогда в git.
+2. **Валидация при старте.** Если конфиг невалиден — приложение НЕ стартует. Fail fast > fail at 3am.
+3. **Immutable после загрузки.** Config читается один раз при старте. Нет hot-reload (если не нужен явно).
+4. **Типизированный конфиг.** Struct с полями, не `map[string]interface{}`.
+5. **Defaults для всего необязательного.** Timeout, retry count, batch size — всегда default.
+
+```go
+type Config struct {
+    HTTPPort    int           `env:"HTTP_PORT" default:"8080"`
+    DBHost      string        `env:"DB_HOST" required:"true"`
+    DBPassword  string        `env:"DB_PASSWORD" required:"true"`  // ТОЛЬКО из env
+    LogLevel    string        `env:"LOG_LEVEL" default:"info"`
+    BatchSize   int           `env:"BATCH_SIZE" default:"100"`
+    RetryCount  int           `env:"RETRY_COUNT" default:"3"`
+    Timeout     time.Duration `env:"TIMEOUT" default:"30s"`
+}
+
+func (c *Config) Validate() error {
+    if c.HTTPPort < 1 || c.HTTPPort > 65535 {
+        return fmt.Errorf("invalid port: %d", c.HTTPPort)
+    }
+    if c.DBHost == "" {
+        return errors.New("DB_HOST is required")
+    }
+    if c.Timeout < time.Second {
+        return fmt.Errorf("timeout too small: %v", c.Timeout)
+    }
+    return nil
+}
+```
+
+---
+
+## ПРИНЦИП 6: ЛОГИРОВАНИЕ — Structured, Leveled, Rotated
+
+### Уровни:
+| Level | Когда | Пример | В проде |
+|-------|-------|--------|---------|
+| DEBUG | Для разработки, сырые данные | "parsed payload: {...}" | OFF |
+| INFO | Значимые бизнес-события | "order created id=123" | ON |
+| WARN | Нештатно, но система работает | "retry 2/3: timeout" | ON |
+| ERROR | Сбой, нужно вмешательство | "DB connection lost" | ON |
+
+### Правила:
+1. **Structured, не sprintf.** `logger.Info("order created", "id", id, "user", user)` — не `log.Printf("Order %s created by %s", id, user)`
+2. **JSON в проде, text в dev.** JSON парсится Elastic/Loki/Grafana. Text читается человеком.
+3. **Ротация обязательна.** `lumberjack`, `logrotate`, или managed logging. Иначе диск заполнится.
+4. **Не логируй циклические события на INFO.** Heartbeat, каждый пакет с датчика, каждый poll — это DEBUG.
+5. **Логируй на границах.** Вход в систему (request), выход (response), ошибки. Не каждый if/else.
+6. **Correlation ID.** Каждый запрос имеет уникальный ID, прошивающий все логи от handler до repo.
+
+```go
+// Middleware добавляет request_id в context
+func RequestIDMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        reqID := r.Header.Get("X-Request-ID")
+        if reqID == "" {
+            reqID = uuid.NewString()
+        }
+        ctx := context.WithValue(r.Context(), "request_id", reqID)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+// Любой лог на любом слое:
+logger.Info("order processed", "request_id", ctx.Value("request_id"), "order_id", id)
+```
+
+---
+
+## ПРИНЦИП 7: ТЕСТИРОВАНИЕ — Пирамида, не песочные часы
+
+```
+         /\           E2E (5-10%)
+        /  \          Полный путь: UI → API → DB → External
+       /----\
+      /      \        Integration (15-25%)
+     / Integr \       Service + real DB (testcontainers)
+    /----------\      Handler + mock service
+   /            \     
+  /   Unit 70%   \   Чистая логика. Моки. <5 секунд.
+ /________________\   Бизнес-правила, валидация, расчёты.
+```
+
+### Что тестировать (приоритет):
+1. **Бизнес-правила** — расчёты, валидации, state machines. Unit.
+2. **Edge cases** — нулевые значения, границы, overflow, пустые массивы. Unit.
+3. **Happy path** — основной сценарий через все слои. Integration.
+4. **Error paths** — что происходит при сбое БД, сети, невалидном вводе. Unit + Integration.
+5. **Контракты API** — status codes, формат ответа. Integration.
+
+### Что НЕ тестировать:
+- Getters/setters
+- JSON serialization/deserialization (если нет кастомной логики)
+- Сторонние библиотеки
+- Конфигурацию (валидируй, не тестируй)
+
+### Table-driven tests (Go-стандарт):
+```go
+func TestCalculateDiscount(t *testing.T) {
+    tests := []struct {
+        name     string
+        amount   float64
+        userType string
+        want     float64
+    }{
+        {"regular under 100", 50.0, "regular", 0.0},
+        {"regular over 100", 150.0, "regular", 7.5},
+        {"premium any amount", 50.0, "premium", 5.0},
+        {"zero amount", 0.0, "regular", 0.0},
+        {"negative amount", -10.0, "regular", 0.0},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            got := CalculateDiscount(tt.amount, tt.userType)
+            assert.InDelta(t, tt.want, got, 0.01)
+        })
+    }
+}
+```
+
+### Правило: один тест — одна проверка. Имя теста описывает сценарий, не метод.
+```
+ПЛОХО:  TestCalculateDiscount
+ХОРОШО: TestCalculateDiscount_PremiumUser_AlwaysGetsMinimumDiscount
+```
+
+---
+
+## ПРИНЦИП 8: API DESIGN — Consistency над всем
+
+### REST конвенции:
+```
+Ресурсы — существительные, множественное число:
+  /api/v1/users           — не /api/v1/user, не /api/v1/getUsers
+  /api/v1/orders          — не /api/v1/order/list
+  /api/v1/order-items     — kebab-case для составных, не orderItems
+
+Действия — HTTP методы:
+  GET    /api/v1/orders          — список (с пагинацией, фильтрами)
+  GET    /api/v1/orders/:id      — один по ID
+  POST   /api/v1/orders          — создать
+  PUT    /api/v1/orders/:id      — полная замена
+  PATCH  /api/v1/orders/:id      — частичное обновление
+  DELETE /api/v1/orders/:id      — удалить
+
+Вложенные ресурсы (не глубже 2 уровней):
+  GET    /api/v1/orders/:id/items     — items конкретного order
+  POST   /api/v1/orders/:id/items     — добавить item в order
+  НЕ:    /api/v1/users/:id/orders/:oid/items/:iid/comments  — слишком глубоко
+
+Query params — для фильтрации, пагинации, сортировки:
+  GET /api/v1/orders?status=pending&page=2&per_page=20&sort=-created_at
+```
+
+### Пагинация (ВСЕГДА для списков):
+```json
+{
+    "data": [...],
+    "meta": {
+        "page": 2,
+        "per_page": 20,
+        "total": 156,
+        "total_pages": 8
+    }
+}
+```
+
+### Ответы об ошибках (единый формат):
+```json
+{
+    "error": {
+        "code": "VALIDATION_FAILED",
+        "message": "Invalid input data",
+        "details": [
+            {"field": "email", "message": "must be a valid email"},
+            {"field": "age", "message": "must be positive"}
+        ]
+    }
+}
+```
+
+### Версионирование:
+- `/api/v1/` с первого дня. Без версии — техдолг навсегда.
+- Новая версия = breaking change. Добавление полей — не breaking.
+- Старая версия живёт минимум 6 месяцев после объявления deprecated.
+
+---
+
+## ПРИНЦИП 9: DATABASE — Миграции, индексы, connection pool
+
+### Миграции:
+1. Пронумерованные файлы: `001_init.up.sql`, `001_init.down.sql`
+2. Up = apply, Down = rollback. Оба ОБЯЗАТЕЛЬНЫ.
+3. Идемпотентность: миграция может быть применена повторно без ошибки.
+4. Никогда не редактируй применённую миграцию. Только новая.
+5. Тестируй на пустой БД: up → down → up должно работать.
+
+### Connection pool:
+```go
+db.SetMaxOpenConns(25)               // не больше чем CPU * 2
+db.SetMaxIdleConns(10)               // ~40% от MaxOpen
+db.SetConnMaxLifetime(5 * time.Minute) // обновлять соединения
+db.SetConnMaxIdleTime(1 * time.Minute)
+```
+
+### Правила SQL:
+1. **Параметризация всегда.** `WHERE id = $1`, никогда `WHERE id = '` + id + `'`
+2. **Индексы по WHERE и JOIN.** Нет индекса = full table scan на проде в 3am.
+3. **EXPLAIN ANALYZE** перед деплоем любого нового запроса.
+4. **Транзакции для связанных операций.** Нет `INSERT; INSERT; UPDATE` без `BEGIN...COMMIT`.
+5. **Context с timeout в каждом запросе.**
+```go
+ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+defer cancel()
+rows, err := db.QueryContext(ctx, query, args...)
+```
+
+---
+
+## ПРИНЦИП 10: CONCURRENCY — Structured, not ad-hoc
+
+### Правила горутин:
+1. **Каждая горутина имеет механизм остановки.** `context.Context` или `done` channel.
+2. **Каждая горутина имеет owner.** Кто-то ждёт её завершения (errgroup, WaitGroup).
+3. **Горутина без owner = утечка.** `go doSomething()` без WaitGroup — баг.
+4. **Не передавай мьютекс как аргумент.** Это признак неправильной декомпозиции.
+
+### Паттерны:
+```go
+// Fan-out / Fan-in:
+results := make(chan Result, len(tasks))
+g, ctx := errgroup.WithContext(ctx)
+g.SetLimit(workers)
+
+for _, task := range tasks {
+    task := task
+    g.Go(func() error {
+        res, err := process(ctx, task)
+        if err != nil { return err }
+        results <- res
+        return nil
+    })
+}
+
+// Pipeline:
+func pipeline(ctx context.Context, input <-chan Raw) <-chan Processed {
+    out := make(chan Processed)
+    go func() {
+        defer close(out)
+        for raw := range input {
+            select {
+            case <-ctx.Done(): return
+            case out <- transform(raw):
+            }
+        }
+    }()
+    return out
+}
+```
+
+### Правило shared state:
+```
+Предпочтение (от лучшего к худшему):
+1. Нет shared state (immutable, channels)
+2. sync.RWMutex (много читателей, мало писателей)
+3. sync.Mutex (простая защита)
+4. sync.Map (только для кэшей с high contention)
+5. atomic (только для счётчиков/флагов)
+
+НИКОГДА: глобальные переменные без защиты
+```
+
+---
+
+## ПРИНЦИП 11: DEPLOY — Автоматизируй или страдай
+
+### Минимальный pipeline:
+```
+git push → lint → test → build → deploy → health check → notify
+```
+
+### Правила:
+1. **Одна команда для деплоя.** `make deploy`, не 5 команд в терминале.
+2. **Backup перед деплоем.** Всегда. `cp binary binary.backup`.
+3. **Rollback за 30 секунд.** `make rollback` восстанавливает предыдущую версию.
+4. **Health check после деплоя.** Не "запустилось" а "отвечает на /health с 200".
+5. **Версионирование.** Бинарник знает свою версию: `--version` выводит git tag + commit + build time.
+6. **Никакого ручного SSH для стандартного деплоя.** SSH — только для диагностики.
+
+### Makefile минимум:
+```makefile
+build:      # Компиляция с version injection
+test:       # go test -race ./...
+lint:       # golangci-lint run
+deploy:     # build + test + lint + scp + restart
+rollback:   # Восстановить backup
+logs:       # ssh + tail -f
+status:     # ssh + systemctl status
+```
+
+---
+
+## ПРИНЦИП 12: OBSERVABILITY — Логи + Метрики + Трейсы
+
+### Три столпа:
+```
+ЛОГИ     — что произошло (событие, ошибка, действие)
+МЕТРИКИ  — сколько/как быстро (counters, histograms, gauges)
+ТРЕЙСЫ   — путь запроса через сервисы (distributed tracing)
+```
+
+### Метрики (минимум для любого сервиса):
+```
+# RED метрики (для каждого endpoint):
+Rate    — requests per second
+Errors  — error rate (%)
+Duration — latency (p50, p95, p99)
+
+# USE метрики (для инфраструктуры):
+Utilization — CPU, memory, disk, connections
+Saturation  — queue depth, goroutine count
+Errors      — connection errors, timeouts
+```
+
+### Health check (обязательный endpoint):
+```json
+GET /health
+{
+    "status": "healthy",          // healthy | degraded | unhealthy
+    "version": "2.8.0",
+    "uptime": "48h32m",
+    "checks": {
+        "database": {"status": "up", "latency_ms": 2},
+        "mqtt": {"status": "up", "latency_ms": 5},
+        "disk": {"status": "ok", "free_gb": 245}
+    }
+}
+```
+
+---
+
+## ПРИНЦИП 13: SECURITY — По умолчанию закрыто
+
+### Чеклист:
+1. **Секреты в env, не в коде.** Проверяй: `grep -r "password\|token\|secret" --include="*.go" --include="*.json"`.
+2. **SQL injection.** Только параметризованные запросы. Никакой конкатенации строк.
+3. **Input validation.** На границе системы (handler). Максимальная длина, допустимые символы, ranges.
+4. **Rate limiting.** На API gateway или в middleware. Минимум 100 req/min для публичных endpoints.
+5. **CORS.** Только разрешённые origins. Не `*` в production.
+6. **HTTPS.** Всегда. Даже для internal services.
+7. **Auth/AuthZ.** JWT или session. Проверяй на КАЖДОМ endpoint (middleware), не на некоторых.
+8. **Не возвращай internal details.** Stack trace, SQL errors, file paths — никогда клиенту.
+9. **Dependency audit.** `go mod tidy && govulncheck ./...` перед каждым релизом.
+
+---
+
+## ПРИНЦИП 14: DOCUMENTATION — Минимум, который реально поддерживается
+
+### Обязательные документы:
+```
+README.md          — Что это, как запустить, как задеплоить (5 минут до рабочего состояния)
+CHANGELOG.md       — Что изменилось в каждой версии
+API.md / OpenAPI   — Контракт API (или auto-generated swagger)
+.env.example       — Все env variables с описанием (без реальных значений)
+Makefile           — Все команды (самодокументируемый)
+```
+
+### Документация в коде:
+```go
+// ХОРОШО: документируй ПОЧЕМУ, не ЧТО
+// Используем batch insert вместо single insert потому что
+// при 30 датчиках × 1 msg/sec single insert создаёт 2.6M транзакций/день,
+// что приводит к WAL bloat и 300% CPU на PostgreSQL.
+func (r *Repo) BatchInsert(ctx context.Context, batch []Reading) error {
+
+// ПЛОХО: документируй очевидное
+// InsertUser inserts a user into the database
+func (r *Repo) InsertUser(ctx context.Context, user User) error {
+```
+
+### Правило: если нужен комментарий чтобы понять код — упрости код. Комментарий = крайняя мера.
+
+---
+
+## МЕТРИКИ ИДЕАЛЬНОГО ПРОЕКТА
+
+| Метрика | Красная зона | Жёлтая зона | Зелёная зона |
+|---------|-------------|-------------|-------------|
+| Время до первого деплоя нового разработчика | > 1 день | 2-4 часа | < 1 час |
+| Время деплоя | > 30 мин (ручной) | 5-30 мин | < 5 мин (автоматический) |
+| Время rollback | > 5 мин | 1-5 мин | < 30 сек |
+| Строк в самом большом файле | > 1000 | 300-1000 | < 300 |
+| Тестовое покрытие (бизнес-логика) | < 20% | 40-60% | > 70% |
+| Время полного прогона тестов | > 10 мин | 2-10 мин | < 2 мин |
+| Количество TODO/FIXME/HACK в коде | > 50 | 10-50 | < 10 |
+| Количество known bugs в production | > 10 | 3-10 | < 3 |
+| Время от коммита до прода (CI/CD) | > 1 час | 15-60 мин | < 15 мин |
+| Среднее время обнаружения бага | > 1 день | 1-4 часа | < 1 час (alerting) |
+| P99 latency API | > 5 сек | 500ms-5s | < 500ms |
+| Uptime | < 99% | 99-99.9% | > 99.9% |
+
+---
+
+## АНТИПАТТЕРНЫ — СТОП-ЛИСТ
+
+| Антипаттерн | Признак | Лечение |
+|-------------|---------|---------|
+| God Object | Struct с 15+ полями и 30+ методами | Split по ответственностям |
+| God File | Файл >500 строк | Split по причинам изменения |
+| Shotgun Surgery | Одно изменение → правки в 5+ файлах | Собери связанный код вместе |
+| Leaky Abstraction | Handler знает про SQL | Repository pattern |
+| Log & Throw | `log.Error(err); return err` | Логируй OR возвращай, не оба |
+| Stringly Typed | `status := "active"` вместо enum | Const или custom type |
+| Copy-Paste Reuse | Один SQL запрос в 6 файлах | Вынеси в repo, переиспользуй |
+| Config in Code | `password := "secret123"` | Env variables |
+| Magic Numbers | `if count > 42` | Named const с объяснением |
+| Premature Optimization | Кэш до первого пользователя | Measure first, optimize second |
+| No Error Context | `return err` без wrap | `return fmt.Errorf("context: %w", err)` |
+| Fire and Forget | `go doWork()` без WaitGroup | errgroup или structured concurrency |
+| Global State | `var db *sql.DB` на уровне пакета | Dependency injection |
+| Test After | "Потом напишу тесты" | TDD или хотя бы test-first для бизнес-логики |
+
+---
+
+## 10 ЗОЛОТЫХ ПРАВИЛ ИДЕАЛЬНОГО ПРОДУКТА
+
+```
+1.  ГРАНИЦЫ > КОД.      Правильные границы между слоями важнее качества кода внутри.
+2.  ТЕСТИРУЕМОСТЬ > УДОБСТВО.  Если нельзя протестировать — архитектура сломана.
+3.  ЯВНОЕ > НЕЯВНОЕ.     Dependency injection > global state. Config > convention.
+4.  СКУЧНОЕ > УМНОЕ.     Простой switch/case > reflection magic. Очевидный код > clever hack.
+5.  ОДИН РАЗ > ВЕЗДЕ.    SQL в одном repo, не в 6 файлах. Логирование в одном месте, не на каждом слое.
+6.  FAIL FAST > FAIL LATER.  Невалидный конфиг → crash при старте, не NPE в проде через 3 дня.
+7.  MEASURE > GUESS.     Профилируй, потом оптимизируй. Не "мне кажется тут медленно".
+8.  AUTOMATE > DOCUMENT.  Makefile > README с 20 шагами. CI/CD > "не забудь запустить тесты".
+9.  SMALL > BIG.         Маленький PR (200 строк) > монструозный (2000 строк). Маленький сервис > God Object.
+10. PRODUCTION > FEATURES.  Логирование, мониторинг, алерты, rollback — ДО новых фич.
+```

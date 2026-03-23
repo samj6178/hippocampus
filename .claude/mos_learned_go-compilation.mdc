@@ -1,0 +1,18 @@
+# Learned Patterns: Go-Compilation
+
+Auto-generated from 2 incidents in hippocampus.
+
+## 1. ERROR: MCP binary path mismatch: Cursor starts bin/hippocampus.exe but 'go build' outputs to project root hippocampus.exe
+CONTEXT: After rebuilding hippocampus, MCP tools disappear because Cursor is running the OLD binary from bin/
+ROOT CAUSE: mcp.json command points to d:\go\hippocampus\bin\hippocampus.exe but go build -o hippocampus.exe writes to project root
+FIX: Always build with: go build -o bin/hippocampus.exe ./cmd/hippocampus/
+PREVENTION: Add Makefile or build script that always targets bin/ directory
+FILE: cmd/hippocampus/main.go
+
+## 2. ERROR: undefined: app.ContextWriter
+CONTEXT: Adding context writer to REST server
+ROOT CAUSE: Forgot to import the app package after restructuring the REST server
+FIX: Added context writer as dependency to rest.Server struct and NewServer constructor
+PREVENTION: When adding new dependencies to any server struct, always update both struct definition and constructor
+FILE: internal/adapter/rest/router.go
+

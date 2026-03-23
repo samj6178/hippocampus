@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS emotional_tags CASCADE;

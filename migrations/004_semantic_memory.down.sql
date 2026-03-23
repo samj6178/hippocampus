@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS semantic_edges CASCADE;
+DROP TABLE IF EXISTS semantic_memory CASCADE;

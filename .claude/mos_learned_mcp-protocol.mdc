@@ -1,0 +1,18 @@
+# Learned Patterns: Mcp-Protocol
+
+Auto-generated from 2 incidents in hippocampus.
+
+## 1. ERROR: StoreIfProcedural is called TWICE for every remember/learn_error: once inside EncodeService.Encode() goroutine (line 180-184) and once in MCP handler (toolRemember line 282-288, toolLearnError line 209). This creates duplicate procedural memories.
+CONTEXT: Deep analysis of encode pipeline quality
+ROOT CAUSE: Procedural detection was added in two places independently — in the encode service as a generic feature, and in MCP handlers as a specific enhancement. Neither checked if the other already does it.
+FIX: Remove StoreIfProcedural calls from MCP handlers (handlers.go). Keep only the one in EncodeService.Encode() which is the canonical encode path.
+PREVENTION: Single responsibility: procedural detection belongs in EncodeService only. MCP handlers should never duplicate logic that exists in the service layer.
+FILE: internal/adapter/mcp/handlers.go, internal/app/encode_service.go
+
+## 2. ERROR: MCP binary path mismatch: Cursor starts bin/hippocampus.exe but 'go build' outputs to project root hippocampus.exe
+CONTEXT: After rebuilding hippocampus, MCP tools disappear because Cursor is running the OLD binary from bin/
+ROOT CAUSE: mcp.json command points to d:\go\hippocampus\bin\hippocampus.exe but go build -o hippocampus.exe writes to project root
+FIX: Always build with: go build -o bin/hippocampus.exe ./cmd/hippocampus/
+PREVENTION: Add Makefile or build script that always targets bin/ directory
+FILE: cmd/hippocampus/main.go
+
