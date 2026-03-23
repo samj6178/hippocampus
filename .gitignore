@@ -36,6 +36,10 @@ web_dist/
 *.out
 coverage.html
 
+# Agent config (local per-user)
+.claude/
+.cursor/
+
 # Temp
 tmp/
 *.tmp

@@ -18,8 +18,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
-          cache: true
+          go-version-file: 'go.mod'
 
       - name: go vet
         run: go vet ./...
@@ -32,25 +31,17 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
-          cache: true
+          go-version-file: 'go.mod'
 
       - name: Run unit tests
         run: |
-          go test -race -count=1 -coverprofile=coverage.out \
+          go test -race -count=1 \
             ./internal/app/... \
             ./internal/domain/... \
             ./internal/adapter/mcp/... \
             ./internal/embedding/... \
             ./internal/memory/... \
             ./internal/pkg/...
-
-      - name: Coverage report
-        run: |
-          go tool cover -func=coverage.out
-          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
-          echo "Total coverage: ${COVERAGE}%"
-          echo "## Test Coverage: ${COVERAGE}%" >> $GITHUB_STEP_SUMMARY
 
   build:
     name: Build
@@ -65,8 +56,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
-          cache: true
+          go-version-file: 'go.mod'
 
       - name: Build
         env:
