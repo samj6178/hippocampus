@@ -1,4 +1,9 @@
-<!-- HIPPOCAMPUS:BEGIN -->
+---
+description: Auto-generated live context from Hippocampus MOS
+globs: ["**/*"]
+alwaysApply: true
+---
+
 # hippocampus (updated 2026-03-24 01:31)
 
 Memory: 82 episodic, 950 semantic | Use `mos_recall` for deep search, `mos_remember` to store, `mos_session_end` at end
@@ -52,4 +57,4 @@ Memory: 82 episodic, 950 semantic | Use `mos_recall` for deep search, `mos_remem
 - (4 days ago) TEST: Claude Code MCP integration test - context_writer evaluation in progress
 - (5 days ago) v1.4 RELEASE RESULTS (2026-03-18): 5 critical fixes applied. (1) IncludeGlobal disabled for project-scoped recall — no more arxiv/cross-project nois...
 - (5 days ago) CODE CHANGE: hippocampus_agent.mdc — Complete rewrite of agent rule. Now mandates: 1) mos_feedback MANDATORY after every recall (skip only if 0 sour...
-<!-- HIPPOCAMPUS:END -->
+

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	llmprovider "github.com/hippocampus-mcp/hippocampus/internal/adapter/llm"
 	"github.com/hippocampus-mcp/hippocampus/internal/app"
 	"github.com/hippocampus-mcp/hippocampus/internal/domain"
 	"github.com/hippocampus-mcp/hippocampus/internal/metrics"
@@ -1388,4 +1389,141 @@ func (s *Server) toolABTest(ctx context.Context) (any, error) {
 		"by_category":       report.ByCategory,
 		"duration_ms":       report.Duration.Milliseconds(),
 	}, nil
+}
+
+// --- mos_configure_llm ---
+
+func (s *Server) toolConfigureLLM(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args struct {
+		BaseURL string `json:"base_url"`
+		Model   string `json:"model"`
+		APIKey  string `json:"api_key"`
+		MaxRPM  int    `json:"max_rpm"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if args.BaseURL == "" || args.Model == "" {
+		return nil, fmt.Errorf("base_url and model are required")
+	}
+	if args.MaxRPM <= 0 {
+		args.MaxRPM = 60
+	}
+
+	if s.llmSwitch == nil {
+		return nil, fmt.Errorf("LLM switch not available")
+	}
+
+	newProvider := llmprovider.NewOpenAICompatProvider(llmprovider.ProviderConfig{
+		BaseURL:       args.BaseURL,
+		Model:         args.Model,
+		APIKey:        args.APIKey,
+		MaxRPM:        args.MaxRPM,
+		MaxConcurrent: 2,
+	}, s.logger)
+
+	if !newProvider.IsAvailable(ctx) {
+		return nil, fmt.Errorf("LLM at %s is not available", args.BaseURL)
+	}
+
+	s.llmSwitch.Switch(newProvider)
+
+	return map[string]any{
+		"status":  "configured",
+		"message": fmt.Sprintf("LLM switched to %s at %s", args.Model, args.BaseURL),
+	}, nil
+}
+
+// --- mos_consolidate_complete ---
+
+func (s *Server) toolConsolidateComplete(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args struct {
+		Results []struct {
+			TaskID string `json:"task_id"`
+			Result string `json:"result"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if len(args.Results) == 0 {
+		return nil, fmt.Errorf("results array is required")
+	}
+
+	completed := 0
+	errors := 0
+	for _, r := range args.Results {
+		task, ok := s.pendingTasks.Get(r.TaskID)
+		if !ok {
+			errors++
+			continue
+		}
+
+		var projectID *uuid.UUID
+		if task.Metadata != nil {
+			if pid, ok := task.Metadata["project_id"].(*uuid.UUID); ok {
+				projectID = pid
+			}
+		}
+
+		switch task.Type {
+		case "synthesize":
+			_, err := s.encode.Encode(ctx, &app.EncodeRequest{
+				Content:    r.Result,
+				ProjectID:  projectID,
+				Importance: 0.8,
+				Tags:       []string{"synthesized", "agent_processed"},
+			})
+			if err != nil {
+				s.logger.Warn("failed to store synthesized result", "task_id", r.TaskID, "error", err)
+				errors++
+				continue
+			}
+		case "generate_rule":
+			_, err := s.encode.Encode(ctx, &app.EncodeRequest{
+				Content:    r.Result,
+				ProjectID:  projectID,
+				Importance: 0.9,
+				Tags:       []string{"auto_rule", "error_pattern", "prevention", "agent_processed"},
+			})
+			if err != nil {
+				s.logger.Warn("failed to store rule", "task_id", r.TaskID, "error", err)
+				errors++
+				continue
+			}
+		default:
+			s.logger.Warn("unknown pending task type", "type", task.Type, "task_id", r.TaskID)
+			errors++
+			continue
+		}
+
+		s.pendingTasks.Remove(r.TaskID)
+		completed++
+	}
+
+	return map[string]any{
+		"completed": completed,
+		"errors":    errors,
+		"pending":   s.pendingTasks.Count(),
+	}, nil
+}
+
+// --- mos_llm_process ---
+
+func (s *Server) toolLLMProcess(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args struct {
+		TaskID string `json:"task_id"`
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if args.TaskID == "" || args.Result == "" {
+		return nil, fmt.Errorf("task_id and result are required")
+	}
+
+	wrapped, _ := json.Marshal(map[string]any{
+		"results": []map[string]string{{"task_id": args.TaskID, "result": args.Result}},
+	})
+	return s.toolConsolidateComplete(ctx, wrapped)
 }

@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	llmprovider "github.com/hippocampus-mcp/hippocampus/internal/adapter/llm"
 	"github.com/hippocampus-mcp/hippocampus/internal/app"
 	"github.com/hippocampus-mcp/hippocampus/internal/domain"
 	"github.com/hippocampus-mcp/hippocampus/internal/metrics"
@@ -53,6 +54,8 @@ type Server struct {
 	abBenchmark        *app.ABBenchmark
 	episodic           domain.EpisodicRepo
 	logger             *slog.Logger
+	llmSwitch          *llmprovider.SwitchableProvider
+	pendingTasks       *PendingTaskStore
 
 	pendingOps sync.WaitGroup
 
@@ -102,9 +105,10 @@ func NewServer(
 	preventionAnalyzer *app.PreventionAnalyzer,
 	abBenchmark *app.ABBenchmark,
 	episodic domain.EpisodicRepo,
+	llmSwitch *llmprovider.SwitchableProvider,
 	logger *slog.Logger,
 ) *Server {
-	return &Server{
+	s := &Server{
 		encode:             encode,
 		recall:             recall,
 		project:            project,
@@ -129,9 +133,12 @@ func NewServer(
 		preventionAnalyzer: preventionAnalyzer,
 		abBenchmark:        abBenchmark,
 		episodic:           episodic,
+		llmSwitch:          llmSwitch,
 		logger:             logger,
 		writer:             os.Stdout,
 	}
+	s.pendingTasks = NewPendingTaskStore()
+	return s
 }
 
 type jsonRPCRequest struct {
@@ -395,6 +402,12 @@ func (s *Server) handleToolCall(ctx context.Context, req *jsonRPCRequest) {
 		result, err = s.toolCite(ctx, params.Arguments)
 	case "mos_ab_test":
 		result, err = s.toolABTest(ctx)
+	case "mos_configure_llm":
+		result, err = s.toolConfigureLLM(ctx, params.Arguments)
+	case "mos_consolidate_complete":
+		result, err = s.toolConsolidateComplete(ctx, params.Arguments)
+	case "mos_llm_process":
+		result, err = s.toolLLMProcess(ctx, params.Arguments)
 	default:
 		s.sendError(req.ID, -32602, "unknown tool: "+params.Name)
 		return

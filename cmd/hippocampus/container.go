@@ -72,13 +72,19 @@ func NewContainer(ctx context.Context, cfg *config.Config, migrationsDir string,
 	)
 	logger.Info("embedding provider ready", "model", embProvider.ModelID())
 
-	initialLLM := llmprovider.NewOpenAICompatProvider(llmprovider.ProviderConfig{
-		BaseURL: cfg.LLM.BaseURL, APIKey: cfg.LLM.APIKey,
-		Model: cfg.LLM.Model, MaxRPM: cfg.LLM.MaxRPM,
-		MaxConcurrent: cfg.LLM.MaxConcurrent,
-	}, logger)
-	llmSwitch := llmprovider.NewSwitchableProvider(initialLLM, logger)
-	logger.Info("LLM provider ready", "name", llmSwitch.Name())
+	var llmSwitch *llmprovider.SwitchableProvider
+	if cfg.LLM.Provider == "none" || cfg.LLM.Provider == "" {
+		llmSwitch = llmprovider.NewSwitchableProvider(nil, logger)
+		logger.Info("LLM provider: none (agent-delegated mode)")
+	} else {
+		initialLLM := llmprovider.NewOpenAICompatProvider(llmprovider.ProviderConfig{
+			BaseURL: cfg.LLM.BaseURL, APIKey: cfg.LLM.APIKey,
+			Model: cfg.LLM.Model, MaxRPM: cfg.LLM.MaxRPM,
+			MaxConcurrent: cfg.LLM.MaxConcurrent,
+		}, logger)
+		llmSwitch = llmprovider.NewSwitchableProvider(initialLLM, logger)
+		logger.Info("LLM provider ready", "name", llmSwitch.Name())
+	}
 
 	// Working Memory
 	workingMem := memory.NewWorkingMemory(memory.WorkingMemoryConfig{
@@ -150,7 +156,7 @@ func NewContainer(ctx context.Context, cfg *config.Config, migrationsDir string,
 		encodeSvc, recallSvc, projectSvc, consolidateSvc, memorySvc, ingestSvc,
 		healthSvc, contextWriter, ruleGen, metricsSvc, predictionSvc, researchAgent,
 		evalFramework, benchmarkSuite, studySvc, analogizeSvc, metaSvc, proceduralSvc,
-		knowledgeScheduler, fusionEngine, warningMatcher, preventionAnalyzer, abBenchmark, episodicRepo, logger,
+		knowledgeScheduler, fusionEngine, warningMatcher, preventionAnalyzer, abBenchmark, episodicRepo, llmSwitch, logger,
 	)
 
 	// REST Server

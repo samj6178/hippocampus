@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -31,12 +32,18 @@ func (sp *SwitchableProvider) Chat(ctx context.Context, messages []domain.ChatMe
 	sp.mu.RLock()
 	p := sp.current
 	sp.mu.RUnlock()
+	if p == nil {
+		return "", fmt.Errorf("no LLM provider configured (set provider in config or call mos_configure_llm)")
+	}
 	return p.Chat(ctx, messages, opts)
 }
 
 func (sp *SwitchableProvider) Name() string {
 	sp.mu.RLock()
 	defer sp.mu.RUnlock()
+	if sp.current == nil {
+		return "none"
+	}
 	return sp.current.Name()
 }
 
@@ -44,6 +51,9 @@ func (sp *SwitchableProvider) IsAvailable(ctx context.Context) bool {
 	sp.mu.RLock()
 	p := sp.current
 	sp.mu.RUnlock()
+	if p == nil {
+		return false
+	}
 	return p.IsAvailable(ctx)
 }
 
@@ -55,7 +65,15 @@ func (sp *SwitchableProvider) Switch(newProvider domain.LLMProvider) {
 	old := sp.current
 	sp.current = newProvider
 	sp.mu.Unlock()
-	sp.logger.Info("LLM provider switched", "from", old.Name(), "to", newProvider.Name())
+	oldName := "none"
+	if old != nil {
+		oldName = old.Name()
+	}
+	newName := "none"
+	if newProvider != nil {
+		newName = newProvider.Name()
+	}
+	sp.logger.Info("LLM provider switched", "from", oldName, "to", newName)
 }
 
 // Current returns the active provider for inspection.
@@ -78,6 +96,10 @@ func (sp *SwitchableProvider) Status(ctx context.Context) LLMStatus {
 	sp.mu.RLock()
 	p := sp.current
 	sp.mu.RUnlock()
+
+	if p == nil {
+		return LLMStatus{ProviderName: "none", Available: false}
+	}
 
 	status := LLMStatus{
 		ProviderName: p.Name(),

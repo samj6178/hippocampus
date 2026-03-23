@@ -68,12 +68,23 @@ func (s *ConsolidateService) SetLLM(llm domain.LLMProvider) {
 }
 
 type ConsolidateResult struct {
-	ProjectID          *uuid.UUID `json:"project_id,omitempty"`
-	EpisodesProcessed  int        `json:"episodes_processed"`
-	ClustersFormed     int        `json:"clusters_formed"`
-	SemanticCreated    int        `json:"semantic_created"`
-	EpisodesMarked     int        `json:"episodes_marked"`
-	SingletonsSkipped  int        `json:"singletons_skipped"`
+	ProjectID          *uuid.UUID     `json:"project_id,omitempty"`
+	EpisodesProcessed  int            `json:"episodes_processed"`
+	ClustersFormed     int            `json:"clusters_formed"`
+	SemanticCreated    int            `json:"semantic_created"`
+	EpisodesMarked     int            `json:"episodes_marked"`
+	SingletonsSkipped  int            `json:"singletons_skipped"`
+	PendingTasks       []PendingTask  `json:"pending_tasks,omitempty"`
+}
+
+// PendingTask represents an LLM task that hippocampus delegates to the client agent.
+// When no local LLM is configured, consolidation returns these tasks with prompts
+// for the agent to process and submit back via mos_consolidate_complete.
+type PendingTask struct {
+	ID       string         `json:"task_id"`
+	Type     string         `json:"type"` // "synthesize", "generate_rule"
+	Prompt   string         `json:"prompt"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 type cluster struct {
@@ -168,11 +179,16 @@ func (s *ConsolidateService) Run(ctx context.Context, projectID *uuid.UUID) (*Co
 	metrics.ConsolidationPromoted.Add(float64(result.SemanticCreated))
 
 	// Pattern → Rule graduation: find clusters of error episodes and
-	// generate rules. When 3+ similar errors exist, the system has enough
+	// generate rules. When 2+ similar errors exist, the system has enough
 	// evidence to formulate a prevention rule automatically.
-	rulesGenerated := s.graduateErrorPatterns(ctx, projectID)
+	// When LLM is nil, returns pending tasks for the agent to process.
+	rulesGenerated, pendingTasks := s.graduateErrorPatternsWithPending(ctx, projectID)
 	if rulesGenerated > 0 {
 		s.logger.Info("error patterns graduated to rules", "rules", rulesGenerated)
+	}
+	if len(pendingTasks) > 0 {
+		result.PendingTasks = pendingTasks
+		s.logger.Info("pending tasks for agent", "count", len(pendingTasks))
 	}
 
 	s.logger.Info("consolidation completed",
@@ -568,13 +584,17 @@ func (s *ConsolidateService) promoteCluster(ctx context.Context, cl *cluster, pr
 // generates prevention rules via LLM. This is the "skill acquisition" layer:
 // repeated errors → condensed rule → proactive prevention.
 func (s *ConsolidateService) graduateErrorPatterns(ctx context.Context, projectID *uuid.UUID) int {
-	if s.llm == nil {
-		return 0
-	}
+	rules, _ := s.graduateErrorPatternsWithPending(ctx, projectID)
+	return rules
+}
 
+// graduateErrorPatternsWithPending generates prevention rules from error clusters.
+// When LLM is available: generates rules directly, returns (count, nil).
+// When LLM is nil: returns (0, pendingTasks) — prompts for the agent to process.
+func (s *ConsolidateService) graduateErrorPatternsWithPending(ctx context.Context, projectID *uuid.UUID) (int, []PendingTask) {
 	errors, err := s.episodic.ListByTags(ctx, projectID, []string{"error"}, 50)
 	if err != nil || len(errors) < 2 {
-		return 0
+		return 0, nil
 	}
 
 	// Embed all error episodes
@@ -582,13 +602,40 @@ func (s *ConsolidateService) graduateErrorPatterns(ctx context.Context, projectI
 	for i, ep := range errors {
 		emb, err := s.embedding.Embed(ctx, ep.Content)
 		if err != nil {
-			return 0
+			return 0, nil
 		}
 		embs[i] = emb
 	}
 
 	// Cluster errors with lower threshold (0.60) to catch related errors
 	clusters := s.clusterWithThreshold(errors, embs, 0.60)
+
+	// When LLM unavailable: build prompts for the agent to process (two-phase delegation)
+	if s.llm == nil || !s.llm.IsAvailable(ctx) {
+		var pending []PendingTask
+		for _, cl := range clusters {
+			if len(cl.members) < 2 {
+				continue
+			}
+			if s.ruleAlreadyExists(ctx, cl.centroid, projectID) {
+				continue
+			}
+			prompt := s.buildRulePrompt(cl)
+			pending = append(pending, PendingTask{
+				ID:     uuid.New().String(),
+				Type:   "generate_rule",
+				Prompt: prompt,
+				Metadata: map[string]any{
+					"cluster_size": len(cl.members),
+					"project_id":  projectID,
+				},
+			})
+			if len(pending) >= 5 {
+				break
+			}
+		}
+		return 0, pending
+	}
 
 	const maxRulesPerRun = 5
 	rulesGenerated := 0
@@ -653,7 +700,7 @@ func (s *ConsolidateService) graduateErrorPatterns(ctx context.Context, projectI
 		}
 	}
 
-	return rulesGenerated
+	return rulesGenerated, nil
 }
 
 func (s *ConsolidateService) ruleAlreadyExists(ctx context.Context, centroid []float32, projectID *uuid.UUID) bool {
@@ -668,6 +715,37 @@ func (s *ConsolidateService) ruleAlreadyExists(ctx context.Context, centroid []f
 		}
 	}
 	return false
+}
+
+// buildRulePrompt creates the LLM prompt for rule generation without calling the LLM.
+// Used for two-phase delegation: prompt is returned to the agent for processing.
+func (s *ConsolidateService) buildRulePrompt(cl *cluster) string {
+	var prompt strings.Builder
+	prompt.WriteString("You are analyzing recurring code errors. Generate a CONCRETE prevention rule.\n\n")
+	prompt.WriteString("Output ONLY this format, nothing else:\n")
+	prompt.WriteString("WHEN: <specific trigger — package, function, pattern>\n")
+	prompt.WriteString("WATCH: <exact thing to check — specific code pattern or mistake>\n")
+	prompt.WriteString("BECAUSE: <what happened, with actual error messages from below>\n")
+	prompt.WriteString("DO: <exact fix instruction, with code example if possible>\n")
+	prompt.WriteString("ANTIPATTERN: <regex matching ONLY the buggy pattern, not valid usage. Must include surrounding context to avoid false positives. If no precise regex is possible, write NONE.>\n\n")
+	prompt.WriteString("Rules:\n")
+	prompt.WriteString("- NEVER use words: ensure, be careful, make sure, consider, remember to\n")
+	prompt.WriteString("- Include specific function names, package names, error messages from the errors below\n")
+	prompt.WriteString("- ANTIPATTERN must NOT match valid code — it should detect ONLY the mistake\n")
+	prompt.WriteString("- If you cannot write a precise regex, use ANTIPATTERN: NONE\n\n")
+	prompt.WriteString("Errors:\n\n")
+	for i, ep := range cl.members {
+		if i >= 5 {
+			prompt.WriteString(fmt.Sprintf("... and %d more similar errors\n", len(cl.members)-5))
+			break
+		}
+		content := ep.Content
+		if len(content) > 400 {
+			content = content[:400] + "..."
+		}
+		prompt.WriteString(fmt.Sprintf("Error %d:\n%s\n\n", i+1, content))
+	}
+	return prompt.String()
 }
 
 func (s *ConsolidateService) generateRule(ctx context.Context, cl *cluster) (string, error) {

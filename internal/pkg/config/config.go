@@ -60,7 +60,7 @@ type MemoryConfig struct {
 }
 
 type LLMConfig struct {
-	Provider      string `json:"provider"`       // "openai-compat"
+	Provider      string `json:"provider"`       // "openai-compat", "none" (delegate to agent)
 	BaseURL       string `json:"base_url"`       // default: "http://localhost:11434/v1" (Ollama)
 	APIKey        string `json:"api_key"`        // empty for Ollama
 	Model         string `json:"model"`          // default: "qwen2.5:7b"

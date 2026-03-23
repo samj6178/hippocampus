@@ -467,5 +467,53 @@ func tools() []map[string]any {
 				"properties": map[string]any{},
 			},
 		},
+		{
+			"name":        "mos_configure_llm",
+			"description": "Configure or switch the LLM provider at runtime. Supports any OpenAI-compatible API (Ollama, DeepSeek, OpenRouter, Together AI, Anthropic). Use this to connect a stronger model or switch providers without restarting.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"base_url": map[string]any{"type": "string", "description": "OpenAI-compatible API base URL (e.g. http://localhost:11434/v1 for Ollama, https://api.deepseek.com/v1 for DeepSeek)"},
+					"model":    map[string]any{"type": "string", "description": "Model name (e.g. qwen2.5:7b, deepseek-chat, claude-sonnet-4-20250514)"},
+					"api_key":  map[string]any{"type": "string", "description": "API key (optional for Ollama)"},
+					"max_rpm":  map[string]any{"type": "integer", "description": "Max requests per minute (default: 60)"},
+				},
+				"required": []string{"base_url", "model"},
+			},
+		},
+		{
+			"name":        "mos_consolidate_complete",
+			"description": "Complete pending LLM tasks from mos_consolidate. When consolidation returns pending_tasks (because no LLM is configured), process them with your LLM and submit results here.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"results": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"task_id": map[string]any{"type": "string"},
+								"result":  map[string]any{"type": "string", "description": "LLM-generated text (synthesized fact or prevention rule)"},
+							},
+							"required": []string{"task_id", "result"},
+						},
+						"description": "Array of completed tasks with their LLM results",
+					},
+				},
+				"required": []string{"results"},
+			},
+		},
+		{
+			"name":        "mos_llm_process",
+			"description": "Submit a single LLM-processed result for a pending task. Use when any tool returns a pending_task that needs LLM processing.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task_id": map[string]any{"type": "string", "description": "The pending task ID to complete"},
+					"result":  map[string]any{"type": "string", "description": "The LLM-generated result text"},
+				},
+				"required": []string{"task_id", "result"},
+			},
+		},
 	}
 }
