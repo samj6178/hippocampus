@@ -39,6 +39,7 @@ coverage.html
 # Agent config (local per-user)
 .claude/
 .cursor/
+CLAUDE.md
 
 # Temp
 tmp/
