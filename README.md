@@ -4,7 +4,7 @@
 
 [![Go 1.25](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev)
 [![MCP Tools](https://img.shields.io/badge/MCP_tools-33-5C6BC0)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-530%2B-4CAF50)](https://github.com/hippocampus-mcp/hippocampus)
+[![Tests](https://img.shields.io/badge/tests-540%2B-4CAF50)](https://github.com/samj6178/hippocampus)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ---
@@ -45,39 +45,34 @@ Rules are written into `.cursor/rules/` and `.claude/` as `.mdc` files — live 
 - **Docker** — for TimescaleDB ([install](https://docs.docker.com/get-docker/))
 - **Ollama** — local LLM runtime ([install](https://ollama.ai))
 
-### Step 1 — Install Ollama and pull models
+### Step 1 — Install Ollama (embeddings only)
+
+Hippocampus needs Ollama only for text embeddings (274MB model). The LLM for rule generation is **optional** — your AI agent (Claude, GPT-4, Gemini) handles it automatically via two-phase delegation.
 
 ```bash
-# Install Ollama (Linux/macOS)
-curl -fsSL https://ollama.ai/install.sh | sh
+# Install Ollama
+curl -fsSL https://ollama.ai/install.sh | sh   # Linux/macOS
+# Windows: https://ollama.ai/download
 
-# Windows: download from https://ollama.ai/download
-
-# Start Ollama server (runs on http://localhost:11434)
+# Start Ollama and pull the embedding model
 ollama serve
-
-# Pull required models (in a separate terminal)
-ollama pull nomic-embed-text    # embeddings, 274MB, 768-dim vectors
-ollama pull qwen2.5:7b          # LLM for rule generation, 4.7GB
+ollama pull nomic-embed-text    # 274MB — this is all you need
 ```
 
-**Want better rule quality?** Use a stronger LLM:
+**Optional: local LLM for background tasks**
 
-| Model | Size | Rule Quality | Speed | Config |
-|-------|------|-------------|-------|--------|
-| `qwen2.5:7b` | 4.7GB | Good (default) | ~3s/rule | `"model": "qwen2.5:7b"` |
-| `qwen2.5:14b` | 9GB | Better | ~6s/rule | `"model": "qwen2.5:14b"` |
-| `qwen2.5:32b` | 20GB | Best local | ~15s/rule | `"model": "qwen2.5:32b"` |
-| `llama3.1:8b` | 4.7GB | Good | ~3s/rule | `"model": "llama3.1:8b"` |
-| `deepseek-coder-v2:16b` | 9GB | Best for code | ~8s/rule | `"model": "deepseek-coder-v2:16b"` |
+If you want hippocampus to generate rules autonomously (without an agent connected), install a local LLM:
 
 ```bash
-# Example: upgrade to a stronger model
-ollama pull qwen2.5:14b
-# Then change "model" in config.json → "qwen2.5:14b"
+ollama pull qwen2.5:7b          # 4.7GB, good default
+# Or use the web dashboard to connect DeepSeek, OpenRouter, etc.
 ```
 
-You can also point to **any OpenAI-compatible API** (DeepSeek, Together, OpenRouter) by changing `base_url` and adding an `api_key` in config.
+| Mode | LLM Source | Setup |
+|------|-----------|-------|
+| **Claude Code** | Opus/Sonnet (automatic) | `"provider": "none"` in config |
+| **Cursor** | Your selected model (automatic) | `"provider": "none"` in config |
+| **Background** | Local Ollama or cloud API | Configure via web dashboard |
 
 ### Step 2 — Start the database
 
@@ -97,7 +92,7 @@ docker run -d --name hippocampus-db \
 ### Step 3 — Build and configure
 
 ```bash
-git clone https://github.com/hippocampus-mcp/hippocampus.git
+git clone https://github.com/samj6178/hippocampus.git
 cd hippocampus
 
 # Build the binary
@@ -140,10 +135,7 @@ cp config.example.json config.json
     "dimensions": 768
   },
   "llm": {
-    "base_url": "http://localhost:11434/v1",
-    "model": "qwen2.5:7b",
-    "max_rpm": 60,
-    "max_concurrent": 2
+    "provider": "none"
   },
   "memory": {
     "consolidation_interval": "6h",
@@ -152,7 +144,7 @@ cp config.example.json config.json
 }
 ```
 
-All `base_url` fields point to Ollama's OpenAI-compatible API — zero external API keys required. To use a cloud provider, change `base_url` and add `api_key`.
+`"provider": "none"` means the agent handles all LLM tasks via two-phase delegation — no local model required. For background processing (timer-based consolidation, scheduled tasks without an agent), use the web dashboard at `http://localhost:8080` to connect any OpenAI-compatible API.
 
 ### MCP Integration
 
@@ -176,9 +168,8 @@ All `base_url` fields point to Ollama's OpenAI-compatible API — zero external 
 {
   "mcpServers": {
     "hippocampus": {
-      "command": "D:\\go\\hippocampus\\bin\\hippocampus.exe",
-      "args": ["-config", "D:\\go\\hippocampus\\config.json",
-               "-migrations", "D:\\go\\hippocampus\\migrations"]
+      "command": "./bin/hippocampus",
+      "args": ["-config", "./config.json", "-migrations", "./migrations"]
     }
   }
 }
@@ -279,6 +270,24 @@ At session end, `mos_session_end` triggers `PreventionAnalyzer`:
 - Runs `git diff <session-start-commit>`
 - For each injected warning with an `ANTIPATTERN` regex, checks whether the anti-pattern appears in the added lines
 - Reports: **Prevented** (warning shown, anti-pattern absent) vs **Ignored** (warning shown, anti-pattern present)
+
+---
+
+## Agent-Delegated LLM
+
+Hippocampus delegates all LLM work to your agent — no local model needed for rule generation.
+
+**How it works:**
+
+1. Agent calls `mos_consolidate` → hippocampus clusters errors (CPU + embeddings)
+2. Returns `pending_tasks` with prompts for the agent to process
+3. Agent generates rules using its own LLM (Opus, Sonnet, GPT-4, Gemini)
+4. Agent calls `mos_consolidate_complete` with results
+5. Hippocampus stores high-quality rules
+
+This means rules generated by Opus 4.6 (200B+ params) instead of a local 7B model — dramatically better anti-patterns, more specific WHEN/WATCH/DO instructions, and fewer false positives.
+
+**Fallback:** For background processing (timer-based consolidation, scheduled tasks), configure any OpenAI-compatible API via the web dashboard or `mos_configure_llm`.
 
 ---
 
