@@ -175,14 +175,66 @@ cp config.example.json config.json
 }
 ```
 
-**Usage pattern** — add to your `CLAUDE.md` or system prompt:
+### Full Automation (recommended)
 
+Hippocampus can run fully automatically using Claude Code hooks. Add this to your **global** `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"HIPPOCAMPUS AUTO: Call mos_init with the current workspace path NOW. This is the first action of every session. Do not skip.\"}}'",
+          "statusMessage": "Hippocampus: session init"
+        }]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUseFailure\",\"additionalContext\":\"HIPPOCAMPUS AUTO: A tool just failed. Call mos_learn_error with the error message, root cause, and fix. Do not skip error capture.\"}}'",
+          "statusMessage": "Hippocampus: error detected"
+        }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"Stop\",\"additionalContext\":\"HIPPOCAMPUS AUTO: Session ending. If mos_session_end was not called yet, call it now with a summary of what was done.\"}}'",
+          "statusMessage": "Hippocampus: session end check"
+        }]
+      }
+    ]
+  }
+}
 ```
+
+This gives you:
+
+| Hook | When | What happens |
+|------|------|-------------|
+| **SessionStart** | Every new conversation | Agent auto-calls `mos_init`, loads full context |
+| **PostToolUseFailure** | Any tool error | Agent auto-calls `mos_learn_error`, captures bug |
+| **Stop** | Session ending | Agent auto-calls `mos_session_end`, saves summary |
+
+Also add to your **global** `~/.claude/CLAUDE.md`:
+
+```markdown
+## Hippocampus MOS (MANDATORY)
+
 - Call mos_init at the start of every session with the workspace path
 - Call mos_learn_error on ANY error (compilation, test failure, runtime error)
 - Call mos_recall before starting any significant task
+- Call mos_file_context before editing important files
 - Call mos_session_end with a summary when finishing
+- When mos_consolidate returns pending_tasks, process the prompts and call mos_consolidate_complete
 ```
+
+**For Cursor users** — add the same instructions to `.cursorrules` in your project root.
 
 ---
 
