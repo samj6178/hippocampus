@@ -24,13 +24,15 @@ type ServerConfig struct {
 }
 
 type DatabaseConfig struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	DBName   string `json:"db_name"`
-	User     string `json:"user"`
-	Password string `json:"password"`
-	MaxConns int    `json:"max_conns"`
-	RawDSN   string `json:"-"` // set via DATABASE_URL env, bypasses field-based DSN
+	Driver     string `json:"driver"`      // "sqlite" (default) or "postgres"
+	SQLitePath string `json:"sqlite_path"` // path to SQLite file (default: "hippocampus.db")
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	DBName     string `json:"db_name"`
+	User       string `json:"user"`
+	Password   string `json:"password"`
+	MaxConns   int    `json:"max_conns"`
+	RawDSN     string `json:"-"` // set via DATABASE_URL env, bypasses field-based DSN
 }
 
 func (d *DatabaseConfig) DSN() string {
@@ -42,6 +44,7 @@ func (d *DatabaseConfig) DSN() string {
 }
 
 type OpenAIConfig struct {
+	Mode       string `json:"mode"`       // "none" (BM25-only), "cloud", "ollama" (default)
 	APIKey     string `json:"api_key"`
 	BaseURL    string `json:"base_url"`
 	Model      string `json:"model"`
@@ -57,6 +60,17 @@ type MemoryConfig struct {
 	DecayHalfLifeDays     float64 `json:"decay_half_life_days"`
 	GateThreshold         float64 `json:"gate_threshold"`
 	EmbeddingCacheSize    int     `json:"embedding_cache_size"`
+	Recall                RecallConfig `json:"recall"`
+}
+
+// RecallConfig allows tuning the recall relevance detection thresholds.
+// Defaults are tuned for nomic-embed-text (768d). Higher-dim models (OpenAI 1536d)
+// produce higher similarities — set absolute_floor=0.35, entropy_best=0.55, kw_check=0.72.
+type RecallConfig struct {
+	AbsoluteFloor   float64 `json:"absolute_floor"`    // Min similarity to consider relevant. Default: 0.30 (768d), 0.35 (1536d)
+	EntropyBest     float64 `json:"entropy_best"`      // Max best_sim for entropy rejection. Default: 0.45 (768d), 0.55 (1536d)
+	KWCheckThresh   float64 `json:"kw_check_threshold"` // Below this sim, require keyword overlap. Default: 0.60 (768d), 0.72 (1536d)
+	KWAcceptThresh  float64 `json:"kw_accept_threshold"` // Semantic sim that bypasses keyword check. Default: 0.43 (768d), 0.50 (1536d)
 }
 
 type LLMConfig struct {
@@ -115,18 +129,20 @@ func Load(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	var errs []string
 
-	// Database
-	if c.Database.Host == "" {
-		errs = append(errs, "database.host is required")
-	}
-	if c.Database.Port < 1 || c.Database.Port > 65535 {
-		errs = append(errs, fmt.Sprintf("database.port invalid: %d", c.Database.Port))
-	}
-	if c.Database.DBName == "" {
-		errs = append(errs, "database.db_name is required")
-	}
-	if c.Database.MaxConns < 1 {
-		errs = append(errs, fmt.Sprintf("database.max_conns must be >= 1, got %d", c.Database.MaxConns))
+	// Database (PostgreSQL-specific validation only when driver is postgres)
+	if c.Database.Driver == "postgres" {
+		if c.Database.Host == "" {
+			errs = append(errs, "database.host is required")
+		}
+		if c.Database.Port < 1 || c.Database.Port > 65535 {
+			errs = append(errs, fmt.Sprintf("database.port invalid: %d", c.Database.Port))
+		}
+		if c.Database.DBName == "" {
+			errs = append(errs, "database.db_name is required")
+		}
+		if c.Database.MaxConns < 1 {
+			errs = append(errs, fmt.Sprintf("database.max_conns must be >= 1, got %d", c.Database.MaxConns))
+		}
 	}
 
 	// Server ports
@@ -143,18 +159,20 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Embedding
-	if c.OpenAI.BaseURL == "" {
-		errs = append(errs, "openai.base_url is required")
-	}
-	if c.OpenAI.Model == "" {
-		errs = append(errs, "openai.model is required")
-	}
-	if c.OpenAI.Dimensions < 1 {
-		errs = append(errs, fmt.Sprintf("openai.dimensions must be >= 1, got %d", c.OpenAI.Dimensions))
-	}
-	if c.OpenAI.MaxBatch < 1 {
-		errs = append(errs, fmt.Sprintf("openai.max_batch must be >= 1, got %d", c.OpenAI.MaxBatch))
+	// Embedding (skip when mode is "none" — BM25-only)
+	if c.OpenAI.Mode != "none" {
+		if c.OpenAI.BaseURL == "" {
+			errs = append(errs, "openai.base_url is required")
+		}
+		if c.OpenAI.Model == "" {
+			errs = append(errs, "openai.model is required")
+		}
+		if c.OpenAI.Dimensions < 1 {
+			errs = append(errs, fmt.Sprintf("openai.dimensions must be >= 1, got %d", c.OpenAI.Dimensions))
+		}
+		if c.OpenAI.MaxBatch < 1 {
+			errs = append(errs, fmt.Sprintf("openai.max_batch must be >= 1, got %d", c.OpenAI.MaxBatch))
+		}
 	}
 
 	// LLM
@@ -210,14 +228,17 @@ func defaultConfig() *Config {
 			RESTPort: 8080,
 		},
 		Database: DatabaseConfig{
-			Host:     "localhost",
-			Port:     5432,
-			DBName:   "hippocampus",
-			User:     "mos",
-			Password: "mos",
-			MaxConns: 25,
+			Driver:     "sqlite",
+			SQLitePath: "hippocampus.db",
+			Host:       "localhost",
+			Port:       5432,
+			DBName:     "hippocampus",
+			User:       "mos",
+			Password:   "mos",
+			MaxConns:   25,
 		},
 		OpenAI: OpenAIConfig{
+			Mode:       "none",
 			BaseURL:    "http://localhost:11434/v1",
 			Model:      "nomic-embed-text",
 			Dimensions: 768,
@@ -231,6 +252,12 @@ func defaultConfig() *Config {
 			DecayHalfLifeDays:        7.0,
 			GateThreshold:            0.3,
 			EmbeddingCacheSize:       10000,
+			Recall: RecallConfig{
+				AbsoluteFloor:  0.30,
+				EntropyBest:    0.45,
+				KWCheckThresh:  0.60,
+				KWAcceptThresh: 0.43,
+			},
 		},
 		LLM: LLMConfig{
 			Provider:      "openai-compat",

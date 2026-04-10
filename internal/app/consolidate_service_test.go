@@ -56,8 +56,11 @@ func (m *mockEpisodicRepo) UpdateImportance(context.Context, uuid.UUID, float64)
 func (m *mockEpisodicRepo) ListByTags(context.Context, *uuid.UUID, []string, int) ([]*domain.EpisodicMemory, error) {
 	return nil, nil
 }
-func (m *mockEpisodicRepo) Delete(context.Context, uuid.UUID) error          { return nil }
-func (m *mockEpisodicRepo) Count(context.Context, *uuid.UUID) (int, error)   { return 0, nil }
+func (m *mockEpisodicRepo) FindByContentHash(context.Context, *uuid.UUID, string) (*domain.EpisodicMemory, error) {
+	return nil, domain.ErrNotFound
+}
+func (m *mockEpisodicRepo) Delete(context.Context, uuid.UUID) error        { return nil }
+func (m *mockEpisodicRepo) Count(context.Context, *uuid.UUID) (int, error) { return 0, nil }
 
 type mockSemanticRepo struct {
 	inserted     []*domain.SemanticMemory
@@ -610,7 +613,7 @@ func TestClusterWithThreshold_TwoClusters(t *testing.T) {
 
 // --- promoteCluster tests ---
 
-func TestPromoteCluster_ImportanceFloor(t *testing.T) {
+func TestPromoteCluster_ImportanceNoArtificialFloor(t *testing.T) {
 	eps := []*domain.EpisodicMemory{
 		makeEpisode("ERROR: low importance error one", 0.2, []string{"error"}, nil),
 		makeEpisode("ERROR: low importance error two", 0.3, []string{"error"}, nil),
@@ -626,8 +629,10 @@ func TestPromoteCluster_ImportanceFloor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if sem.Importance < 0.6 {
-		t.Errorf("importance should be floored to 0.6, got %f", sem.Importance)
+	// Importance = max(avg(0.2, 0.3), max(0.2, 0.3)) = max(0.25, 0.3) = 0.3
+	// No artificial floor — low-quality clusters retain their natural importance.
+	if sem.Importance > 0.31 || sem.Importance < 0.29 {
+		t.Errorf("importance should be ~0.3 (max of sources), got %f", sem.Importance)
 	}
 }
 

@@ -112,15 +112,20 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrationsDir string
 		logger.Info("applying migration", "version", version, "notx", noTx)
 
 		if noTx {
+			// For @notx migrations (e.g. TimescaleDB continuous aggregates),
+			// execute each statement separately outside any transaction.
 			noTxConn, err := pool.Acquire(ctx)
 			if err != nil {
 				return fmt.Errorf("acquire notx conn for %s: %w", version, err)
 			}
-			_, err = noTxConn.Conn().PgConn().Exec(ctx, sqlStr).ReadAll()
-			noTxConn.Release()
-			if err != nil {
-				return fmt.Errorf("apply %s: %w", version, err)
+			stmts := splitSQLStatements(sqlStr)
+			for _, stmt := range stmts {
+				if _, err := noTxConn.Exec(ctx, stmt); err != nil {
+					noTxConn.Release()
+					return fmt.Errorf("apply %s: %w", version, err)
+				}
 			}
+			noTxConn.Release()
 		} else {
 			if _, err := conn.Exec(ctx, sqlStr); err != nil {
 				return fmt.Errorf("apply %s: %w", version, err)
@@ -135,4 +140,31 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrationsDir string
 	}
 
 	return nil
+}
+
+// splitSQLStatements splits a SQL file into individual statements by semicolons.
+// Skips empty statements and comment-only lines.
+func splitSQLStatements(sql string) []string {
+	raw := strings.Split(sql, ";")
+	var result []string
+	for _, s := range raw {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		// Skip comment-only fragments
+		lines := strings.Split(s, "\n")
+		hasCode := false
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "--") {
+				hasCode = true
+				break
+			}
+		}
+		if hasCode {
+			result = append(result, s)
+		}
+	}
+	return result
 }

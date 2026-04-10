@@ -2,8 +2,7 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/hippocampus-mcp/hippocampus/internal/domain"
 	"github.com/hippocampus-mcp/hippocampus/internal/memory"
 	"github.com/hippocampus-mcp/hippocampus/internal/metrics"
+	"github.com/hippocampus-mcp/hippocampus/internal/pkg/contenthash"
 )
 
 // EncodeService implements the ENCODE operation of Memory Algebra.
@@ -29,8 +29,11 @@ type EncodeService struct {
 	logger     *slog.Logger
 	gateThreshold   float64
 	emotionDetector EmotionDetector
-	recentHashes    map[string]struct{}
-	recentHashesMu  sync.Mutex
+	recentHashSet  map[string]struct{}
+	recentHashRing []string
+	recentHashIdx  int
+	recentHashCap  int
+	recentHashMu   sync.Mutex
 }
 
 type EncodeServiceConfig struct {
@@ -56,14 +59,17 @@ func NewEncodeService(
 	if cfg.GateThreshold <= 0 {
 		cfg.GateThreshold = 0.3
 	}
+	const dedupCap = 10000
 	return &EncodeService{
-		episodic:      episodic,
-		emotional:     emotional,
-		embedding:     embedding,
-		working:       working,
-		logger:        logger,
-		gateThreshold: cfg.GateThreshold,
-		recentHashes:  make(map[string]struct{}),
+		episodic:       episodic,
+		emotional:      emotional,
+		embedding:      embedding,
+		working:        working,
+		logger:         logger,
+		gateThreshold:  cfg.GateThreshold,
+		recentHashSet:  make(map[string]struct{}, dedupCap),
+		recentHashRing: make([]string, dedupCap),
+		recentHashCap:  dedupCap,
 	}
 }
 
@@ -113,22 +119,48 @@ func (s *EncodeService) Encode(ctx context.Context, req *EncodeRequest) (*Encode
 		req.Content = truncated
 	}
 
-	// Hash-based exact dedup (fast O(1) check before expensive embedding)
-	hash := sha256.Sum256([]byte(strings.TrimSpace(req.Content)))
-	hashKey := hex.EncodeToString(hash[:16]) // 128-bit prefix is enough
-	s.recentHashesMu.Lock()
-	if _, dup := s.recentHashes[hashKey]; dup {
-		s.recentHashesMu.Unlock()
+	// Hash-based exact dedup: fast in-memory check, then persistent DB check.
+	hashKey := contenthash.Of(req.Content)
+
+	// Fast path: in-memory ring buffer catches duplicates within a session.
+	s.recentHashMu.Lock()
+	if _, dup := s.recentHashSet[hashKey]; dup {
+		s.recentHashMu.Unlock()
 		return &EncodeResponse{Encoded: false, GateScore: 0}, nil
 	}
-	s.recentHashes[hashKey] = struct{}{}
-	// Cap map size to prevent unbounded growth
-	if len(s.recentHashes) > 10000 {
-		// Simple eviction: clear all (rare, ~10K unique memories)
-		s.recentHashes = make(map[string]struct{})
-		s.recentHashes[hashKey] = struct{}{}
+	s.recentHashMu.Unlock()
+
+	// Persistent dedup: check DB for content hash (survives restarts).
+	existing, err := s.episodic.FindByContentHash(ctx, req.ProjectID, hashKey)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		s.logger.Warn("persistent dedup check failed, proceeding without dedup",
+			"error", err, "hash", hashKey)
 	}
-	s.recentHashesMu.Unlock()
+	if err == nil && existing != nil {
+		// Duplicate found. Bump importance if new request has higher importance.
+		if req.Importance > existing.Importance {
+			if bumpErr := s.episodic.UpdateImportance(ctx, existing.ID, req.Importance); bumpErr != nil {
+				s.logger.Warn("failed to bump importance on dedup hit", "id", existing.ID, "error", bumpErr)
+			}
+		}
+		s.logger.Debug("persistent dedup hit", "existing_id", existing.ID, "hash", hashKey)
+		return &EncodeResponse{
+			MemoryID:   existing.ID,
+			Encoded:    false,
+			GateScore:  0,
+			TokenCount: existing.TokenCount,
+		}, nil
+	}
+
+	// Record in ring buffer after confirming no DB duplicate.
+	s.recentHashMu.Lock()
+	if old := s.recentHashRing[s.recentHashIdx]; old != "" {
+		delete(s.recentHashSet, old)
+	}
+	s.recentHashSet[hashKey] = struct{}{}
+	s.recentHashRing[s.recentHashIdx] = hashKey
+	s.recentHashIdx = (s.recentHashIdx + 1) % s.recentHashCap
+	s.recentHashMu.Unlock()
 
 	// Content quality gate: reject low-information inputs
 	qualityScore := contentQualityScore(req.Content)
@@ -144,8 +176,11 @@ func (s *EncodeService) Encode(ctx context.Context, req *EncodeRequest) (*Encode
 		return nil, fmt.Errorf("embed: %w", err)
 	}
 
-	// Novelty detection: how different is this from existing memories?
-	novelty := s.computeNovelty(ctx, emb, req.ProjectID)
+	// Novelty detection: skip when embeddings are unavailable (BM25-only mode)
+	novelty := 1.0
+	if len(emb) > 0 {
+		novelty = s.computeNovelty(ctx, emb, req.ProjectID)
+	}
 
 	// Hard reject near-duplicates: if a memory with >90% similarity exists,
 	// this is redundant information regardless of importance.

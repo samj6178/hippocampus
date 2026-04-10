@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -63,6 +66,14 @@ func (s *Server) toolInit(ctx context.Context, rawArgs json.RawMessage) (any, er
 	}
 
 	wsPath := filepath.Clean(args.WorkspacePath)
+
+	// Security: reject path traversal and relative paths
+	if !filepath.IsAbs(wsPath) {
+		return nil, fmt.Errorf("workspace_path must be absolute, got %q", wsPath)
+	}
+	if strings.Contains(wsPath, "..") {
+		return nil, fmt.Errorf("workspace_path must not contain '..'")
+	}
 
 	projects, err := s.project.List(ctx)
 	if err != nil {
@@ -131,7 +142,11 @@ func (s *Server) toolInit(ctx context.Context, rawArgs json.RawMessage) (any, er
 		}
 	}
 
-	s.ctxWriter.WriteAll(ctx)
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s.ctxWriter.WriteAll(bgCtx)
+	}()
 
 	if s.warningMatcher != nil {
 		s.warningMatcher.LoadRules(ctx, &matched.ID)
@@ -191,6 +206,26 @@ func (s *Server) toolLearnError(ctx context.Context, rawArgs json.RawMessage) (a
 		return nil, err
 	}
 
+	// Dedup by stable triple: ErrorMessage + RootCause + Fix
+	dedupKey := sha256.Sum256([]byte(args.ErrorMessage + "|" + args.RootCause + "|" + args.Fix))
+	dedupHash := hex.EncodeToString(dedupKey[:16])
+	s.errorDedupMu.Lock()
+	if _, dup := s.errorDedupSet[dedupHash]; dup {
+		s.errorDedupMu.Unlock()
+		return map[string]any{
+			"status":  "duplicate",
+			"message": "Identical error already learned this session",
+		}, nil
+	}
+	// Ring buffer eviction
+	if old := s.errorDedupRing[s.errorDedupIdx]; old != "" {
+		delete(s.errorDedupSet, old)
+	}
+	s.errorDedupSet[dedupHash] = struct{}{}
+	s.errorDedupRing[s.errorDedupIdx] = dedupHash
+	s.errorDedupIdx = (s.errorDedupIdx + 1) % len(s.errorDedupRing)
+	s.errorDedupMu.Unlock()
+
 	var content strings.Builder
 	content.WriteString(fmt.Sprintf("ERROR: %s\n", args.ErrorMessage))
 	if args.Context != "" {
@@ -229,6 +264,8 @@ func (s *Server) toolLearnError(ctx context.Context, rawArgs json.RawMessage) (a
 		s.ctxWriter.WriteAll(bgCtx)
 		s.ruleGen.GenerateAll(bgCtx)
 	}()
+
+	s.audit.Log("learn_error", getActiveProjectSlug(), args.ErrorMessage, resp.MemoryID.String())
 
 	return map[string]any{
 		"status":    "learned",
@@ -281,10 +318,24 @@ func (s *Server) toolRemember(ctx context.Context, rawArgs json.RawMessage) (any
 	}
 
 	if !resp.Encoded {
+		// Distinguish duplicate from gate rejection.
+		// Duplicates: MemoryID set (persistent dedup) or GateScore == 0 (ring buffer dedup).
+		// Gate rejections always have GateScore > 0 (quality or thalamic gate).
+		isDuplicate := resp.MemoryID != uuid.Nil || resp.GateScore == 0
+		if isDuplicate {
+			result := map[string]any{
+				"status":  "duplicate",
+				"message": "Identical or near-identical memory already exists.",
+			}
+			if resp.MemoryID != uuid.Nil {
+				result["memory_id"] = resp.MemoryID
+			}
+			return result, nil
+		}
 		return map[string]any{
 			"status":     "gated",
 			"gate_score": resp.GateScore,
-			"message":    "Memory did not pass importance gate. Increase importance or lower gate threshold.",
+			"message":    "Memory did not pass importance/quality gate.",
 		}, nil
 	}
 
@@ -293,6 +344,8 @@ func (s *Server) toolRemember(ctx context.Context, rawArgs json.RawMessage) (any
 		// Note: StoreIfProcedural is already called inside EncodeService.Encode()
 		s.ctxWriter.WriteAll(bgCtx)
 	}()
+
+	s.audit.Log("remember", getActiveProjectSlug(), mcpFirstLine(args.Content), resp.MemoryID.String())
 
 	return rememberResult{
 		Status:     "stored",
@@ -305,9 +358,10 @@ func (s *Server) toolRemember(ctx context.Context, rawArgs json.RawMessage) (any
 // --- mos_recall ---
 
 type recallArgs struct {
-	Query       string `json:"query"`
-	Project     string `json:"project,omitempty"`
-	BudgetTokens int   `json:"budget_tokens,omitempty"`
+	Query        string `json:"query"`
+	Project      string `json:"project,omitempty"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	Room         string `json:"room,omitempty"`
 }
 
 type recallResult struct {
@@ -340,6 +394,7 @@ func (s *Server) toolRecall(ctx context.Context, rawArgs json.RawMessage) (any, 
 		Budget:        budget,
 		AgentID:       s.agentID(),
 		IncludeGlobal: projectID == nil,
+		Room:          args.Room,
 	})
 	if err != nil {
 		return nil, err
@@ -359,6 +414,7 @@ func (s *Server) toolRecall(ctx context.Context, rawArgs json.RawMessage) (any, 
 
 	contextText := resp.Context.Text
 	warningsCount := 0
+	var structuredWarnings []map[string]any
 
 	if s.warningMatcher != nil {
 		signals := app.MatchSignals{
@@ -371,6 +427,27 @@ func (s *Server) toolRecall(ctx context.Context, rawArgs json.RawMessage) (any, 
 			contextText = formatWarnings(warnings) + "\n" + contextText
 			warningsCount = len(warnings)
 			s.trackExposure(warnings)
+
+			if s.ruleTracker != nil {
+				var ruleIDs []uuid.UUID
+				for _, w := range warnings {
+					ruleIDs = append(ruleIDs, w.Rule.ID)
+				}
+				s.ruleTracker.RecordExposure(ruleIDs)
+			}
+
+			for _, w := range warnings {
+				sw := map[string]any{
+					"signal":       w.Signal,
+					"confidence":   w.Confidence,
+					"when":         w.Rule.WhenText,
+					"watch":        w.Rule.WatchText,
+					"do":           w.Rule.DoText,
+					"anti_pattern": w.Rule.AntiPattern,
+					"files":        w.Rule.FilePaths,
+				}
+				structuredWarnings = append(structuredWarnings, sw)
+			}
 		}
 	}
 
@@ -382,6 +459,7 @@ func (s *Server) toolRecall(ctx context.Context, rawArgs json.RawMessage) (any, 
 		"confidence":           resp.Context.Confidence,
 		"source_ids":           sourceIDs,
 		"warnings_count":       warningsCount,
+		"warnings":             structuredWarnings,
 		"feedback_hint":        "Call mos_feedback(memory_id=source_ids[0], useful=true/false) after using these results",
 	}
 
@@ -577,8 +655,9 @@ func (s *Server) toolIngestCodebase(ctx context.Context, rawArgs json.RawMessage
 // --- mos_session_end ---
 
 type sessionEndArgs struct {
-	Summary string `json:"summary"`
-	Project string `json:"project,omitempty"`
+	Summary   string `json:"summary"`
+	NextSteps string `json:"next_steps,omitempty"`
+	Project   string `json:"project,omitempty"`
 }
 
 func (s *Server) toolSessionEnd(ctx context.Context, rawArgs json.RawMessage) (any, error) {
@@ -596,6 +675,9 @@ func (s *Server) toolSessionEnd(ctx context.Context, rawArgs json.RawMessage) (a
 	}
 
 	content := fmt.Sprintf("SESSION SUMMARY: %s", args.Summary)
+	if args.NextSteps != "" {
+		content += fmt.Sprintf("\nNEXT STEPS: %s", args.NextSteps)
+	}
 
 	resp, err := s.encode.Encode(ctx, &app.EncodeRequest{
 		Content:    content,
@@ -603,6 +685,16 @@ func (s *Server) toolSessionEnd(ctx context.Context, rawArgs json.RawMessage) (a
 		Importance: 0.9,
 		Tags:       []string{"session_summary", "auto"},
 	})
+
+	// Store next_steps separately for easy retrieval in buildAutoContext.
+	if args.NextSteps != "" && err == nil {
+		s.encode.Encode(ctx, &app.EncodeRequest{
+			Content:    args.NextSteps,
+			ProjectID:  projectID,
+			Importance: 0.95,
+			Tags:       []string{"next_steps"},
+		})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store session summary: %w", err)
 	}
@@ -626,15 +718,30 @@ func (s *Server) toolSessionEnd(ctx context.Context, rawArgs json.RawMessage) (a
 				s.recordPreventionReport(report)
 				metrics.BugsPrevented.Add(float64(report.Prevented))
 				metrics.WarningsMissed.Add(float64(report.Ignored))
+
+				// Track per-rule outcomes for self-evolving rules
+				if s.ruleTracker != nil {
+					for _, w := range exposedCopy {
+						for _, d := range report.Details {
+							if d.AntiPattern == w.Rule.AntiPattern {
+								s.ruleTracker.RecordOutcome(w.Rule.ID, !d.FoundInDiff)
+							}
+						}
+					}
+				}
 			}
 		}
+	}
+
+	// A/B selector: tick session counter
+	if s.ruleSelector != nil {
+		s.ruleSelector.RecordSession()
 	}
 
 	s.pendingOps.Add(1)
 	go func() {
 		defer s.pendingOps.Done()
 		bgCtx := context.Background()
-		// Note: StoreIfProcedural is already called inside EncodeService.Encode()
 		if _, err := s.consolidate.Run(bgCtx, projectID); err != nil {
 			s.logger.Warn("post-session consolidation failed", "error", err)
 		}
@@ -643,7 +750,30 @@ func (s *Server) toolSessionEnd(ctx context.Context, rawArgs json.RawMessage) (a
 		if s.warningMatcher != nil {
 			s.warningMatcher.LoadRules(bgCtx, projectID)
 		}
+		// Persist rule effectiveness and attempt mutations
+		if s.ruleTracker != nil {
+			s.ruleTracker.Persist(bgCtx)
+		}
+		if s.ruleMutator != nil {
+			mutations, pending := s.ruleMutator.MutateUnderperformingRules(bgCtx)
+			for _, m := range mutations {
+				s.logger.Info("rule evolved", "rule_id", m.RuleID, "from", m.FromVersion, "to", m.ToVersion, "strategy", m.Strategy)
+				if s.ruleSelector != nil {
+					s.ruleSelector.StartTrial(m.RuleID, m.FromVersion, m.ToVersion)
+				}
+			}
+			for _, p := range pending {
+				s.pendingTasks.Add(&PendingTask{
+					ID:       p.ID,
+					Type:     p.Type,
+					Prompt:   p.Prompt,
+					Metadata: p.Metadata,
+				})
+			}
+		}
 	}()
+
+	s.audit.Log("session_end", getActiveProjectSlug(), mcpFirstLine(args.Summary), resp.MemoryID.String())
 
 	result := map[string]any{
 		"status":    "session_saved",
@@ -660,72 +790,86 @@ func (s *Server) toolSessionEnd(ctx context.Context, rawArgs json.RawMessage) (a
 // buildAutoContext assembles rich context from memory at session start.
 // Returns session summaries, active decisions, known error patterns,
 // and procedural warnings — so the agent has full awareness without calling mos_recall.
+// autoContextBudget is the max tokens for auto_context assembled at init.
+// Keeps 95%+ of context window free for actual work, like MemPalace L0+L1.
+const autoContextBudget = 800 // ~3200 chars
+
+// buildAutoContext assembles a token-budgeted context from recent sessions,
+// decisions, error patterns, and recent errors. Sections are added in priority
+// order; when the budget is exhausted, remaining sections are skipped.
 func (s *Server) buildAutoContext(ctx context.Context, projectID *uuid.UUID) string {
 	var b strings.Builder
+	tokensUsed := 0
 
-	// 1. Recent session summaries
-	sessions, err := s.episodic.ListByTags(ctx, projectID, []string{"session_summary"}, 3)
-	if err == nil && len(sessions) > 0 {
-		b.WriteString("## Recent Sessions\n")
-		for _, ep := range sessions {
-			content := ep.Content
-			if len(content) > 200 {
-				content = content[:200] + "..."
-			}
-			age := formatAge(ep.CreatedAt)
-			b.WriteString(fmt.Sprintf("- [%s] %s\n", age, strings.TrimPrefix(content, "SESSION SUMMARY: ")))
+	// Priority-ordered sections: most critical first.
+	type section struct {
+		header string
+		tags   []string
+		limit  int
+		maxPer int // max chars per entry
+	}
+	sections := []section{
+		{"Next Steps (from previous session)", []string{"next_steps"}, 1, 300},
+		{"Known Pitfalls (DO NOT REPEAT)", []string{"learned_pattern"}, 5, 150},
+		{"Recent Sessions", []string{"session_summary"}, 3, 200},
+		{"Active Decisions", []string{"decision"}, 5, 150},
+		{"Recent Errors", []string{"error"}, 3, 150},
+	}
+
+	for _, sec := range sections {
+		if tokensUsed >= autoContextBudget {
+			break
 		}
-		b.WriteString("\n")
-	}
 
-	// 2. Decisions and architecture patterns
-	decisions, err := s.episodic.ListByTags(ctx, projectID, []string{"decision"}, 5)
-	if err == nil && len(decisions) > 0 {
-		b.WriteString("## Active Decisions\n")
-		for _, ep := range decisions {
-			firstLine := mcpFirstLine(ep.Content)
-			if len(firstLine) > 150 {
-				firstLine = firstLine[:150] + "..."
-			}
-			b.WriteString(fmt.Sprintf("- %s\n", firstLine))
+		memories, err := s.episodic.ListByTags(ctx, projectID, sec.tags, sec.limit)
+		if err != nil || len(memories) == 0 {
+			continue
 		}
-		b.WriteString("\n")
-	}
 
-	// 3. Known error patterns (procedural memories = learned mistakes)
-	errors, err := s.episodic.ListByTags(ctx, projectID, []string{"learned_pattern"}, 5)
-	if err == nil && len(errors) > 0 {
-		b.WriteString("## Known Pitfalls (DO NOT REPEAT)\n")
-		for _, ep := range errors {
-			firstLine := mcpFirstLine(ep.Content)
-			if len(firstLine) > 150 {
-				firstLine = firstLine[:150] + "..."
-			}
-			b.WriteString(fmt.Sprintf("- %s\n", firstLine))
+		header := fmt.Sprintf("## %s\n", sec.header)
+		headerTokens := len(header) / 4
+		if tokensUsed+headerTokens >= autoContextBudget {
+			break
 		}
-		b.WriteString("\n")
-	}
 
-	// 4. Recent errors (high importance, error tag)
-	recentErrors, err := s.episodic.ListByTags(ctx, projectID, []string{"error"}, 3)
-	if err == nil && len(recentErrors) > 0 {
-		b.WriteString("## Recent Errors\n")
-		for _, ep := range recentErrors {
-			firstLine := mcpFirstLine(ep.Content)
-			if len(firstLine) > 150 {
-				firstLine = firstLine[:150] + "..."
+		var lines []string
+		sectionTokens := headerTokens
+		for _, ep := range memories {
+			content := mcpFirstLine(ep.Content)
+			if sec.tags[0] == "session_summary" {
+				content = ep.Content
+				content = strings.TrimPrefix(content, "SESSION SUMMARY: ")
 			}
-			age := formatAge(ep.CreatedAt)
-			b.WriteString(fmt.Sprintf("- [%s] %s\n", age, firstLine))
+			if len(content) > sec.maxPer {
+				content = content[:sec.maxPer] + "..."
+			}
+
+			var line string
+			if sec.tags[0] == "session_summary" || sec.tags[0] == "error" {
+				line = fmt.Sprintf("- [%s] %s\n", formatAge(ep.CreatedAt), content)
+			} else {
+				line = fmt.Sprintf("- %s\n", content)
+			}
+
+			lineTokens := len(line) / 4
+			if tokensUsed+sectionTokens+lineTokens > autoContextBudget {
+				break
+			}
+			lines = append(lines, line)
+			sectionTokens += lineTokens
 		}
-		b.WriteString("\n")
+
+		if len(lines) > 0 {
+			b.WriteString(header)
+			for _, l := range lines {
+				b.WriteString(l)
+			}
+			b.WriteString("\n")
+			tokensUsed += sectionTokens
+		}
 	}
 
-	result := b.String()
-	if len(result) > 3000 {
-		result = result[:3000] + "\n... (truncated)"
-	}
-	return result
+	return b.String()
 }
 
 func formatAge(t time.Time) string {
@@ -1093,6 +1237,12 @@ func (s *Server) toolMetrics(ctx context.Context) (any, error) {
 		"prediction_calibration": s.prediction.GetCalibration(),
 		"pending_predictions":   s.prediction.PendingCount(),
 		"prevention":            prevention,
+	}
+	if s.ruleTracker != nil {
+		result["rule_evolution"] = s.ruleTracker.EvolutionStats()
+	}
+	if s.ruleSelector != nil {
+		result["active_ab_trials"] = s.ruleSelector.ActiveTrialCount()
 	}
 	return result, nil
 }
@@ -1526,4 +1676,309 @@ func (s *Server) toolLLMProcess(ctx context.Context, rawArgs json.RawMessage) (a
 		"results": []map[string]string{{"task_id": args.TaskID, "result": args.Result}},
 	})
 	return s.toolConsolidateComplete(ctx, wrapped)
+}
+
+// --- Conversation Mining ---
+
+type mineConvoArgs struct {
+	SessionsDir string `json:"sessions_dir,omitempty"`
+	Project     string `json:"project,omitempty"`
+}
+
+func (s *Server) toolMineConversations(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args mineConvoArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	if s.convoMiner == nil {
+		return nil, fmt.Errorf("conversation miner not available")
+	}
+
+	projectID, err := s.resolveProject(ctx, args.Project)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionsDir := args.SessionsDir
+	if sessionsDir == "" {
+		// Auto-detect: ~/.claude/projects/<slug>/
+		home, _ := os.UserHomeDir()
+		slug := getActiveProjectSlug()
+		if slug == "" {
+			return nil, fmt.Errorf("no active project and no sessions_dir provided")
+		}
+		sessionsDir = filepath.Join(home, ".claude", "projects", slug)
+		// Also try Windows path format
+		if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
+			// Try D--go-hippocampus style
+			cwd := ""
+			p, pErr := s.project.GetBySlug(ctx, slug)
+			if pErr == nil && p.RootPath != "" {
+				cwd = p.RootPath
+			}
+			if cwd != "" {
+				normalized := strings.ReplaceAll(cwd, ":", "-")
+				normalized = strings.ReplaceAll(normalized, "\\", "-")
+				normalized = strings.ReplaceAll(normalized, "/", "-")
+				sessionsDir = filepath.Join(home, ".claude", "projects", normalized)
+			}
+		}
+	}
+
+	result, err := s.convoMiner.MineSessionsDir(ctx, sessionsDir, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("mine conversations: %w", err)
+	}
+
+	s.audit.Log("mine_conversations", getActiveProjectSlug(),
+		fmt.Sprintf("scanned %d files, created %d memories", result.FilesScanned, result.MemoriesCreated), "")
+
+	return map[string]any{
+		"status":              "completed",
+		"files_scanned":       result.FilesScanned,
+		"messages_read":       result.MessagesRead,
+		"exchanges_extracted": result.ExchangesExtracted,
+		"memories_created":    result.MemoriesCreated,
+		"duplicates_skipped":  result.DuplicatesSkipped,
+	}, nil
+}
+
+// --- Knowledge Graph tools ---
+
+type kgAddArgs struct {
+	Subject    string  `json:"subject"`
+	Predicate  string  `json:"predicate"`
+	Object     string  `json:"object"`
+	Confidence float64 `json:"confidence,omitempty"`
+	Project    string  `json:"project,omitempty"`
+}
+
+func (s *Server) toolKGAdd(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args kgAddArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if args.Subject == "" || args.Predicate == "" || args.Object == "" {
+		return nil, fmt.Errorf("subject, predicate, and object are required")
+	}
+	if args.Confidence <= 0 {
+		args.Confidence = 1.0
+	}
+
+	projectID, err := s.resolveProject(ctx, args.Project)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.kg == nil {
+		return nil, fmt.Errorf("knowledge graph not available")
+	}
+
+	now := time.Now().UTC()
+	triple := &domain.KnowledgeTriple{
+		ID:            uuid.New(),
+		ProjectID:     projectID,
+		Subject:       args.Subject,
+		Predicate:     args.Predicate,
+		Object:        args.Object,
+		ValidFrom:     now,
+		Confidence:    args.Confidence,
+		SourceSession: s.agentID(),
+		CreatedAt:     now,
+	}
+
+	if err := s.kg.Insert(ctx, triple); err != nil {
+		return nil, fmt.Errorf("kg insert: %w", err)
+	}
+
+	s.audit.Log("kg_add", getActiveProjectSlug(),
+		fmt.Sprintf("%s %s %s", args.Subject, args.Predicate, args.Object),
+		triple.ID.String())
+
+	return map[string]any{
+		"status":    "stored",
+		"triple_id": triple.ID,
+		"subject":   args.Subject,
+		"predicate": args.Predicate,
+		"object":    args.Object,
+	}, nil
+}
+
+type kgQueryArgs struct {
+	Entity  string `json:"entity"`
+	AsOf    string `json:"as_of,omitempty"`
+	Project string `json:"project,omitempty"`
+}
+
+func (s *Server) toolKGQuery(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args kgQueryArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if args.Entity == "" {
+		return nil, fmt.Errorf("entity is required")
+	}
+
+	projectID, err := s.resolveProject(ctx, args.Project)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.kg == nil {
+		return nil, fmt.Errorf("knowledge graph not available")
+	}
+
+	var asOf *time.Time
+	if args.AsOf != "" {
+		t, err := time.Parse(time.RFC3339, args.AsOf)
+		if err != nil {
+			return nil, fmt.Errorf("invalid as_of timestamp: %w", err)
+		}
+		asOf = &t
+	}
+
+	outgoing, err := s.kg.QueryBySubject(ctx, projectID, args.Entity, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("kg query subject: %w", err)
+	}
+	incoming, err := s.kg.QueryByObject(ctx, projectID, args.Entity, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("kg query object: %w", err)
+	}
+
+	type tripleView struct {
+		Subject   string  `json:"subject"`
+		Predicate string  `json:"predicate"`
+		Object    string  `json:"object"`
+		Since     string  `json:"valid_since"`
+		Conf      float64 `json:"confidence"`
+	}
+
+	var facts []tripleView
+	for _, t := range outgoing {
+		facts = append(facts, tripleView{
+			Subject: t.Subject, Predicate: t.Predicate, Object: t.Object,
+			Since: t.ValidFrom.Format("2006-01-02"), Conf: t.Confidence,
+		})
+	}
+	for _, t := range incoming {
+		facts = append(facts, tripleView{
+			Subject: t.Subject, Predicate: t.Predicate, Object: t.Object,
+			Since: t.ValidFrom.Format("2006-01-02"), Conf: t.Confidence,
+		})
+	}
+
+	label := "current"
+	if asOf != nil {
+		label = "as of " + asOf.Format("2006-01-02")
+	}
+
+	return map[string]any{
+		"entity":     args.Entity,
+		"query_mode": label,
+		"facts":      facts,
+		"total":      len(facts),
+	}, nil
+}
+
+type kgInvalidateArgs struct {
+	Subject   string `json:"subject"`
+	Predicate string `json:"predicate"`
+	Object    string `json:"object"`
+	Project   string `json:"project,omitempty"`
+}
+
+func (s *Server) toolKGInvalidate(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args kgInvalidateArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if args.Subject == "" || args.Predicate == "" || args.Object == "" {
+		return nil, fmt.Errorf("subject, predicate, and object are required")
+	}
+
+	projectID, err := s.resolveProject(ctx, args.Project)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.kg == nil {
+		return nil, fmt.Errorf("knowledge graph not available")
+	}
+
+	n, err := s.kg.Invalidate(ctx, projectID, args.Subject, args.Predicate, args.Object, time.Now().UTC())
+	if err != nil {
+		return nil, fmt.Errorf("kg invalidate: %w", err)
+	}
+
+	s.audit.Log("kg_invalidate", getActiveProjectSlug(),
+		fmt.Sprintf("%s %s %s (expired %d)", args.Subject, args.Predicate, args.Object, n), "")
+
+	return map[string]any{
+		"status":       "invalidated",
+		"facts_expired": n,
+		"subject":      args.Subject,
+		"predicate":    args.Predicate,
+		"object":       args.Object,
+	}, nil
+}
+
+type kgTimelineArgs struct {
+	Entity  string `json:"entity"`
+	Project string `json:"project,omitempty"`
+}
+
+func (s *Server) toolKGTimeline(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var args kgTimelineArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if args.Entity == "" {
+		return nil, fmt.Errorf("entity is required")
+	}
+
+	projectID, err := s.resolveProject(ctx, args.Project)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.kg == nil {
+		return nil, fmt.Errorf("knowledge graph not available")
+	}
+
+	triples, err := s.kg.Timeline(ctx, projectID, args.Entity)
+	if err != nil {
+		return nil, fmt.Errorf("kg timeline: %w", err)
+	}
+
+	type entry struct {
+		Predicate string  `json:"predicate"`
+		Object    string  `json:"object"`
+		From      string  `json:"valid_from"`
+		To        string  `json:"valid_to,omitempty"`
+		Conf      float64 `json:"confidence"`
+		Active    bool    `json:"active"`
+	}
+
+	var timeline []entry
+	for _, t := range triples {
+		e := entry{
+			Predicate: t.Predicate,
+			Object:    t.Object,
+			From:      t.ValidFrom.Format("2006-01-02"),
+			Conf:      t.Confidence,
+			Active:    t.IsValid(),
+		}
+		if t.ValidTo != nil {
+			e.To = t.ValidTo.Format("2006-01-02")
+		}
+		timeline = append(timeline, e)
+	}
+
+	return map[string]any{
+		"entity":   args.Entity,
+		"timeline": timeline,
+		"total":    len(timeline),
+	}, nil
 }

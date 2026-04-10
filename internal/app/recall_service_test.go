@@ -262,7 +262,7 @@ func TestDomainSpecificRejection(t *testing.T) {
 }
 
 func TestFilterWeakCandidates(t *testing.T) {
-	svc := &RecallService{}
+	svc := &RecallService{embedding: &mockEmbedding{}} // Dimensions()=3, so vector-path is used
 
 	t.Run("filters below relative threshold", func(t *testing.T) {
 		scored := []*domain.ScoredMemory{

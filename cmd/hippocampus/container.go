@@ -6,9 +6,12 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"database/sql"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -16,16 +19,19 @@ import (
 	mcpserver "github.com/hippocampus-mcp/hippocampus/internal/adapter/mcp"
 	restserver "github.com/hippocampus-mcp/hippocampus/internal/adapter/rest"
 	"github.com/hippocampus-mcp/hippocampus/internal/app"
+	"github.com/hippocampus-mcp/hippocampus/internal/domain"
 	"github.com/hippocampus-mcp/hippocampus/internal/embedding"
 	"github.com/hippocampus-mcp/hippocampus/internal/memory"
 	"github.com/hippocampus-mcp/hippocampus/internal/pkg/config"
 	"github.com/hippocampus-mcp/hippocampus/internal/repo"
+	sqliterepo "github.com/hippocampus-mcp/hippocampus/internal/repo/sqlite"
 )
 
 type Container struct {
-	pool    *pgxpool.Pool
-	httpSrv *http.Server
-	logger  *slog.Logger
+	pool     *pgxpool.Pool // nil when using SQLite
+	sqliteDB *sql.DB       // nil when using PostgreSQL
+	httpSrv  *http.Server
+	logger   *slog.Logger
 
 	consolidateSvc     *app.ConsolidateService
 	contextWriter      *app.ContextWriter
@@ -40,37 +46,77 @@ type Container struct {
 }
 
 func NewContainer(ctx context.Context, cfg *config.Config, migrationsDir string, spaFS fs.FS, logger *slog.Logger) (*Container, error) {
-	pool, err := repo.NewPool(ctx, repo.DBConfig{
-		DSN:      cfg.Database.DSN(),
-		MaxConns: int32(cfg.Database.MaxConns),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("database: %w", err)
-	}
-	logger.Info("database connected")
-
-	if err := repo.RunMigrations(ctx, pool, migrationsDir, logger); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("migrations: %w", err)
-	}
-	logger.Info("migrations applied")
-
-	// Repositories
-	episodicRepo := repo.NewEpisodicRepo(pool)
-	semanticRepo := repo.NewSemanticRepo(pool)
-	proceduralRepo := repo.NewProceduralRepo(pool)
-	projectRepo := repo.NewProjectRepo(pool)
-	causalRepo := repo.NewCausalRepo(pool)
-	emotionalRepo := repo.NewEmotionalTagRepo(pool)
-
-	// Providers
-	embProvider := embedding.NewOpenAIProvider(
-		cfg.OpenAI.APIKey, cfg.OpenAI.Model, cfg.OpenAI.MaxBatch, cfg.Memory.EmbeddingCacheSize,
-		embedding.WithBaseURL(cfg.OpenAI.BaseURL),
-		embedding.WithDimensions(cfg.OpenAI.Dimensions),
-		embedding.WithLogger(logger),
+	var (
+		pool         *pgxpool.Pool
+		sqliteDB     *sql.DB
+		episodicRepo domain.EpisodicRepo
+		semanticRepo domain.SemanticRepo
+		proceduralRepo domain.ProceduralRepo
+		projectRepo  domain.ProjectRepo
+		causalRepo   domain.CausalRepo
+		emotionalRepo domain.EmotionalTagRepo
+		kgRepo       domain.KnowledgeGraphRepo
 	)
-	logger.Info("embedding provider ready", "model", embProvider.ModelID())
+
+	switch cfg.Database.Driver {
+	case "sqlite", "":
+		db, err := sqliterepo.NewDB(cfg.Database.SQLitePath)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite open: %w", err)
+		}
+		if err := sqliterepo.RunMigrations(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("sqlite migrations: %w", err)
+		}
+		sqliteDB = db
+		episodicRepo = sqliterepo.NewEpisodicRepo(db)
+		semanticRepo = sqliterepo.NewSemanticRepo(db)
+		proceduralRepo = sqliterepo.NewProceduralRepo(db)
+		projectRepo = sqliterepo.NewProjectRepo(db)
+		causalRepo = sqliterepo.NewCausalRepo(db)
+		emotionalRepo = sqliterepo.NewEmotionalTagRepo(db)
+		kgRepo = sqliterepo.NewKnowledgeGraphRepo(db)
+		logger.Info("database connected", "driver", "sqlite", "path", cfg.Database.SQLitePath)
+
+	case "postgres":
+		var err error
+		pool, err = repo.NewPool(ctx, repo.DBConfig{
+			DSN:      cfg.Database.DSN(),
+			MaxConns: int32(cfg.Database.MaxConns),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("database: %w", err)
+		}
+		if err := repo.RunMigrations(ctx, pool, migrationsDir, logger); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("migrations: %w", err)
+		}
+		episodicRepo = repo.NewEpisodicRepo(pool)
+		semanticRepo = repo.NewSemanticRepo(pool)
+		proceduralRepo = repo.NewProceduralRepo(pool)
+		projectRepo = repo.NewProjectRepo(pool)
+		causalRepo = repo.NewCausalRepo(pool)
+		emotionalRepo = repo.NewEmotionalTagRepo(pool)
+		logger.Info("database connected", "driver", "postgres")
+
+	default:
+		return nil, fmt.Errorf("unsupported database driver: %q (use \"sqlite\" or \"postgres\")", cfg.Database.Driver)
+	}
+
+	// Embedding Provider
+	var embProvider domain.EmbeddingProvider
+	if cfg.OpenAI.Mode == "none" {
+		embProvider = embedding.NewNullProvider()
+		logger.Info("embedding provider: none (BM25-only mode)")
+	} else {
+		embProvider = embedding.NewOpenAIProvider(
+			cfg.OpenAI.APIKey, cfg.OpenAI.Model, cfg.OpenAI.MaxBatch, cfg.Memory.EmbeddingCacheSize,
+			embedding.WithBaseURL(cfg.OpenAI.BaseURL),
+			embedding.WithDimensions(cfg.OpenAI.Dimensions),
+			embedding.WithLogger(logger),
+		)
+		logger.Info("embedding provider ready", "model", embProvider.ModelID())
+	}
 
 	var llmSwitch *llmprovider.SwitchableProvider
 	if cfg.LLM.Provider == "none" || cfg.LLM.Provider == "" {
@@ -99,7 +145,13 @@ func NewContainer(ctx context.Context, cfg *config.Config, migrationsDir string,
 	)
 	recallSvc := app.NewRecallService(
 		episodicRepo, semanticRepo, proceduralRepo, embProvider, workingMem,
-		app.RecallServiceConfig{DecayHalfLifeDays: cfg.Memory.DecayHalfLifeDays}, logger, llmSwitch,
+		app.RecallServiceConfig{
+			DecayHalfLifeDays: cfg.Memory.DecayHalfLifeDays,
+			AbsoluteFloor:    cfg.Memory.Recall.AbsoluteFloor,
+			EntropyBest:      cfg.Memory.Recall.EntropyBest,
+			KWCheckThresh:    cfg.Memory.Recall.KWCheckThresh,
+			KWAcceptThresh:   cfg.Memory.Recall.KWAcceptThresh,
+		}, logger, llmSwitch,
 	)
 
 	causalDetector := app.NewCausalDetector(causalRepo, episodicRepo, embProvider, logger)
@@ -151,13 +203,36 @@ func NewContainer(ctx context.Context, cfg *config.Config, migrationsDir string,
 	preventionAnalyzer := app.NewPreventionAnalyzer(logger)
 	abBenchmark := app.NewABBenchmark(logger)
 
+	// Self-Evolving Rules
+	ruleTracker := app.NewRuleTracker(semanticRepo, logger)
+	ruleMutator := app.NewRuleMutator(ruleTracker, semanticRepo, llmSwitch, logger)
+	ruleSelector := app.NewRuleSelector(ruleTracker)
+
 	// MCP Server
 	mcpSrv := mcpserver.NewServer(
 		encodeSvc, recallSvc, projectSvc, consolidateSvc, memorySvc, ingestSvc,
 		healthSvc, contextWriter, ruleGen, metricsSvc, predictionSvc, researchAgent,
 		evalFramework, benchmarkSuite, studySvc, analogizeSvc, metaSvc, proceduralSvc,
-		knowledgeScheduler, fusionEngine, warningMatcher, preventionAnalyzer, abBenchmark, episodicRepo, llmSwitch, logger,
+		knowledgeScheduler, fusionEngine, warningMatcher, preventionAnalyzer, abBenchmark,
+		ruleTracker, ruleMutator, ruleSelector,
+		episodicRepo, kgRepo, llmSwitch, logger,
 	)
+
+	// Conversation miner: extracts memories from past Claude Code sessions.
+	convoMiner := app.NewConversationMiner(encodeSvc, logger)
+	mcpSrv.SetConversationMiner(convoMiner)
+
+	// Audit log: append-only JSONL for write operation tracking (optional, non-fatal).
+	auditDir := filepath.Dir(cfg.Database.SQLitePath)
+	if auditDir == "." {
+		auditDir = "."
+	}
+	auditLog, err := app.NewAuditLog(auditDir)
+	if err != nil {
+		logger.Warn("audit log disabled", "error", err)
+	} else {
+		mcpSrv.SetAuditLog(auditLog)
+	}
 
 	// REST Server
 	restSrv := restserver.NewServer(
@@ -174,6 +249,7 @@ func NewContainer(ctx context.Context, cfg *config.Config, migrationsDir string,
 
 	return &Container{
 		pool:               pool,
+		sqliteDB:           sqliteDB,
 		httpSrv:            httpSrv,
 		logger:             logger,
 		consolidateSvc:     consolidateSvc,
@@ -252,8 +328,13 @@ func (c *Container) Shutdown(ctx context.Context) {
 	// 4. HTTP server graceful shutdown
 	c.httpSrv.Shutdown(ctx)
 
-	// 5. Close DB pool last (everything else may need it)
-	c.pool.Close()
+	// 5. Close DB last (everything else may need it)
+	if c.pool != nil {
+		c.pool.Close()
+	}
+	if c.sqliteDB != nil {
+		c.sqliteDB.Close()
+	}
 }
 
 func (c *Container) startFileWatcher(ctx context.Context) {

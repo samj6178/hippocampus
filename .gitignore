@@ -45,3 +45,14 @@ CLAUDE.md
 tmp/
 *.tmp
 *.log
+
+# Runtime data (personal)
+audit.jsonl
+bench_results.jsonl
+smoke_*.txt
+.mcp.json
+.mcp.json.backup
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key

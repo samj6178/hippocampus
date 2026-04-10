@@ -52,7 +52,13 @@ type Server struct {
 	warningMatcher     *app.WarningMatcher
 	preventionAnalyzer *app.PreventionAnalyzer
 	abBenchmark        *app.ABBenchmark
+	ruleTracker        *app.RuleTracker
+	ruleMutator        *app.RuleMutator
+	ruleSelector       *app.RuleSelector
 	episodic           domain.EpisodicRepo
+	kg                 domain.KnowledgeGraphRepo
+	convoMiner         *app.ConversationMiner
+	audit              *app.AuditLog
 	logger             *slog.Logger
 	llmSwitch          *llmprovider.SwitchableProvider
 	pendingTasks       *PendingTaskStore
@@ -78,6 +84,12 @@ type Server struct {
 	totalIgnored        int
 	totalExposed        int
 	totalNotApplicable  int
+
+	// Dedup for mos_learn_error: ring buffer of hashes (ErrorMessage+RootCause+Fix)
+	errorDedupMu   sync.Mutex
+	errorDedupSet  map[string]struct{}
+	errorDedupRing []string
+	errorDedupIdx  int
 }
 
 func NewServer(
@@ -104,7 +116,11 @@ func NewServer(
 	warningMatcher *app.WarningMatcher,
 	preventionAnalyzer *app.PreventionAnalyzer,
 	abBenchmark *app.ABBenchmark,
+	ruleTracker *app.RuleTracker,
+	ruleMutator *app.RuleMutator,
+	ruleSelector *app.RuleSelector,
 	episodic domain.EpisodicRepo,
+	kg domain.KnowledgeGraphRepo,
 	llmSwitch *llmprovider.SwitchableProvider,
 	logger *slog.Logger,
 ) *Server {
@@ -132,13 +148,29 @@ func NewServer(
 		warningMatcher:     warningMatcher,
 		preventionAnalyzer: preventionAnalyzer,
 		abBenchmark:        abBenchmark,
+		ruleTracker:        ruleTracker,
+		ruleMutator:        ruleMutator,
+		ruleSelector:       ruleSelector,
 		episodic:           episodic,
+		kg:                 kg,
 		llmSwitch:          llmSwitch,
 		logger:             logger,
 		writer:             os.Stdout,
 	}
 	s.pendingTasks = NewPendingTaskStore()
+	s.errorDedupSet = make(map[string]struct{}, 1024)
+	s.errorDedupRing = make([]string, 1024)
 	return s
+}
+
+// SetAuditLog attaches an optional audit log for write operation tracking.
+func (s *Server) SetAuditLog(al *app.AuditLog) {
+	s.audit = al
+}
+
+// SetConversationMiner attaches an optional conversation miner.
+func (s *Server) SetConversationMiner(cm *app.ConversationMiner) {
+	s.convoMiner = cm
 }
 
 type jsonRPCRequest struct {
@@ -408,6 +440,16 @@ func (s *Server) handleToolCall(ctx context.Context, req *jsonRPCRequest) {
 		result, err = s.toolConsolidateComplete(ctx, params.Arguments)
 	case "mos_llm_process":
 		result, err = s.toolLLMProcess(ctx, params.Arguments)
+	case "mos_mine_conversations":
+		result, err = s.toolMineConversations(ctx, params.Arguments)
+	case "mos_kg_add":
+		result, err = s.toolKGAdd(ctx, params.Arguments)
+	case "mos_kg_query":
+		result, err = s.toolKGQuery(ctx, params.Arguments)
+	case "mos_kg_invalidate":
+		result, err = s.toolKGInvalidate(ctx, params.Arguments)
+	case "mos_kg_timeline":
+		result, err = s.toolKGTimeline(ctx, params.Arguments)
 	default:
 		s.sendError(req.ID, -32602, "unknown tool: "+params.Name)
 		return

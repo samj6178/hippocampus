@@ -18,6 +18,7 @@ type EpisodicRepo interface {
 	ListUnconsolidated(ctx context.Context, projectID *uuid.UUID, limit int) ([]*EpisodicMemory, error)
 	UpdateImportance(ctx context.Context, id uuid.UUID, importance float64) error
 	MarkConsolidated(ctx context.Context, ids []uuid.UUID) error
+	FindByContentHash(ctx context.Context, projectID *uuid.UUID, contentHash string) (*EpisodicMemory, error)
 	ListByTags(ctx context.Context, projectID *uuid.UUID, tags []string, limit int) ([]*EpisodicMemory, error)
 	DecayImportance(ctx context.Context, olderThan time.Duration, factor float64, floor float64) (int, error)
 	Delete(ctx context.Context, id uuid.UUID) error
@@ -95,6 +96,23 @@ type EmotionalTagRepo interface {
 	Insert(ctx context.Context, tag *EmotionalTag) error
 	GetByMemory(ctx context.Context, memoryID uuid.UUID) ([]*EmotionalTag, error)
 	GetHighPriority(ctx context.Context, projectID *uuid.UUID, limit int) ([]*EmotionalTag, error)
+}
+
+// KnowledgeGraphRepo defines storage for temporal knowledge triples.
+type KnowledgeGraphRepo interface {
+	// Insert adds a new triple. ID and CreatedAt are set by the caller.
+	Insert(ctx context.Context, triple *KnowledgeTriple) error
+	// QueryBySubject returns triples where the entity is the subject.
+	// When asOf is non-nil, only triples valid at that time are returned.
+	QueryBySubject(ctx context.Context, projectID *uuid.UUID, subject string, asOf *time.Time) ([]*KnowledgeTriple, error)
+	// QueryByObject returns triples where the entity is the object.
+	QueryByObject(ctx context.Context, projectID *uuid.UUID, object string, asOf *time.Time) ([]*KnowledgeTriple, error)
+	// Invalidate soft-deletes matching triples by setting valid_to.
+	Invalidate(ctx context.Context, projectID *uuid.UUID, subject, predicate, object string, endedAt time.Time) (int, error)
+	// Timeline returns all triples (including expired) for a subject, ordered chronologically.
+	Timeline(ctx context.Context, projectID *uuid.UUID, subject string) ([]*KnowledgeTriple, error)
+	// Stats returns counts of active and expired triples.
+	Stats(ctx context.Context, projectID *uuid.UUID) (active int, expired int, err error)
 }
 
 // EmbeddingProvider generates vector embeddings from text.

@@ -531,9 +531,6 @@ func (s *ConsolidateService) promoteCluster(ctx context.Context, cl *cluster, pr
 	}
 	avgImportance /= float64(len(cl.members))
 	importance := math.Max(avgImportance, maxImportance)
-	if importance < 0.6 {
-		importance = 0.6
-	}
 
 	sourceIDs := make([]uuid.UUID, len(cl.members))
 	for i, ep := range cl.members {

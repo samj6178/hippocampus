@@ -47,6 +47,12 @@ func (r *EpisodicRepo) Insert(ctx context.Context, mem *domain.EpisodicMemory) e
 	return nil
 }
 
+// FindByContentHash is a no-op for PostgreSQL (dedup is handled at application level).
+// PostgreSQL schema does not yet include content_hash column.
+func (r *EpisodicRepo) FindByContentHash(_ context.Context, _ *uuid.UUID, _ string) (*domain.EpisodicMemory, error) {
+	return nil, domain.ErrNotFound
+}
+
 func (r *EpisodicRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.EpisodicMemory, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT id, time, project_id, agent_id, session_id,

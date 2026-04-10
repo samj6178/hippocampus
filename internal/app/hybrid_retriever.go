@@ -107,6 +107,12 @@ func (hr *HybridRetriever) fetchBothSignals(
 	bm25Ch := make(chan bm25Result, 1)
 
 	go func() {
+		// Skip vector search when embeddings are unavailable (BM25-only mode)
+		if len(queryEmb) == 0 {
+			vecCh <- vecResult{nil, nil}
+			return
+		}
+
 		var items []*domain.MemoryItem
 
 		epis, err := hr.episodic.SearchSimilar(ctx, queryEmb, projectID, limit)

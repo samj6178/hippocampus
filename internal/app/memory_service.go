@@ -7,7 +7,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hippocampus-mcp/hippocampus/internal/domain"
-	"github.com/hippocampus-mcp/hippocampus/internal/embedding"
 	"github.com/hippocampus-mcp/hippocampus/internal/memory"
 )
 
@@ -17,7 +16,7 @@ type MemoryService struct {
 	episodic  domain.EpisodicRepo
 	semantic  domain.SemanticRepo
 	project   domain.ProjectRepo
-	emb       *embedding.OpenAIProvider
+	emb       domain.EmbeddingProvider
 	working   *memory.WorkingMemory
 	logger    *slog.Logger
 }
@@ -26,7 +25,7 @@ func NewMemoryService(
 	episodic domain.EpisodicRepo,
 	semantic domain.SemanticRepo,
 	project domain.ProjectRepo,
-	emb *embedding.OpenAIProvider,
+	emb domain.EmbeddingProvider,
 	working *memory.WorkingMemory,
 	logger *slog.Logger,
 ) *MemoryService {
@@ -181,7 +180,15 @@ func (s *MemoryService) Stats(ctx context.Context) (*SystemStats, error) {
 		return nil, fmt.Errorf("semantic count: %w", err)
 	}
 
-	hits, misses, cacheSize := s.emb.CacheStats()
+	var hits, misses int64
+	var cacheSize int
+	type cacheStatter interface {
+		CacheStats() (int64, int64, int)
+	}
+	if cs, ok := s.emb.(cacheStatter); ok {
+		hits, misses, cacheSize = cs.CacheStats()
+	}
+
 	snap := s.working.Snapshot(ctx)
 
 	return &SystemStats{

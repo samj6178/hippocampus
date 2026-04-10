@@ -22,6 +22,8 @@ type encodeEpisodicRepo struct {
 	updateErr         error
 	similarResults    []*domain.EpisodicMemory
 	similarErr        error
+	findByHashResult  *domain.EpisodicMemory
+	findByHashErr     error
 }
 
 func (m *encodeEpisodicRepo) Insert(_ context.Context, mem *domain.EpisodicMemory) error {
@@ -39,6 +41,16 @@ func (m *encodeEpisodicRepo) UpdateImportance(_ context.Context, id uuid.UUID, i
 
 func (m *encodeEpisodicRepo) SearchSimilar(_ context.Context, _ []float32, _ *uuid.UUID, _ int) ([]*domain.EpisodicMemory, error) {
 	return m.similarResults, m.similarErr
+}
+
+func (m *encodeEpisodicRepo) FindByContentHash(_ context.Context, _ *uuid.UUID, _ string) (*domain.EpisodicMemory, error) {
+	if m.findByHashErr != nil {
+		return nil, m.findByHashErr
+	}
+	if m.findByHashResult != nil {
+		return m.findByHashResult, nil
+	}
+	return nil, domain.ErrNotFound
 }
 
 type encodeEmotionalRepo struct {
@@ -375,6 +387,110 @@ func TestEncode_EmotionalTagInsertError(t *testing.T) {
 	}
 	if !resp.Encoded {
 		t.Error("memory should still be encoded despite tag failure")
+	}
+}
+
+// --- persistent dedup ---
+
+func TestEncode_PersistentDedupHit(t *testing.T) {
+	existingID := uuid.New()
+	ep := &encodeEpisodicRepo{}
+	// Override FindByContentHash to return an existing memory.
+	ep.findByHashResult = &domain.EpisodicMemory{
+		MemoryItem: domain.MemoryItem{
+			ID:         existingID,
+			Importance: 0.6,
+			TokenCount: 42,
+		},
+	}
+	svc := newTestEncodeService(ep, nil, &mockEmbedding{embeddings: [][]float32{{0.1}}}, 0.3)
+
+	resp, err := svc.Encode(context.Background(), &EncodeRequest{
+		Content:    "some important finding about database performance",
+		Importance: 0.5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Encoded {
+		t.Error("expected Encoded=false for persistent duplicate")
+	}
+	if resp.MemoryID != existingID {
+		t.Errorf("MemoryID = %s, want %s (existing)", resp.MemoryID, existingID)
+	}
+	if resp.TokenCount != 42 {
+		t.Errorf("TokenCount = %d, want 42 (from existing)", resp.TokenCount)
+	}
+	if len(ep.inserted) != 0 {
+		t.Error("should not insert when dedup hits")
+	}
+}
+
+func TestEncode_PersistentDedupBumpsImportance(t *testing.T) {
+	existingID := uuid.New()
+	ep := &encodeEpisodicRepo{}
+	ep.findByHashResult = &domain.EpisodicMemory{
+		MemoryItem: domain.MemoryItem{
+			ID:         existingID,
+			Importance: 0.3, // existing is low
+		},
+	}
+	svc := newTestEncodeService(ep, nil, &mockEmbedding{embeddings: [][]float32{{0.1}}}, 0.3)
+
+	_, err := svc.Encode(context.Background(), &EncodeRequest{
+		Content:    "some important finding about database performance tuning",
+		Importance: 0.9, // new request has higher importance
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if bumped, ok := ep.updatedImportance[existingID]; !ok {
+		t.Error("expected importance bump on dedup hit with higher importance")
+	} else if bumped != 0.9 {
+		t.Errorf("bumped importance = %f, want 0.9", bumped)
+	}
+}
+
+func TestEncode_PersistentDedupNoBumpWhenLower(t *testing.T) {
+	existingID := uuid.New()
+	ep := &encodeEpisodicRepo{}
+	ep.findByHashResult = &domain.EpisodicMemory{
+		MemoryItem: domain.MemoryItem{
+			ID:         existingID,
+			Importance: 0.9, // existing is already high
+		},
+	}
+	svc := newTestEncodeService(ep, nil, &mockEmbedding{embeddings: [][]float32{{0.1}}}, 0.3)
+
+	_, err := svc.Encode(context.Background(), &EncodeRequest{
+		Content:    "some important finding about database indexing strategies",
+		Importance: 0.3, // new request has lower importance
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := ep.updatedImportance[existingID]; ok {
+		t.Error("should NOT bump importance when new importance is lower")
+	}
+}
+
+func TestEncode_PersistentDedupDbErrorGraceful(t *testing.T) {
+	ep := &encodeEpisodicRepo{}
+	ep.findByHashErr = errors.New("database connection lost")
+	svc := newTestEncodeService(ep, nil, &mockEmbedding{embeddings: [][]float32{{0.1}}}, 0.3)
+
+	// Should proceed with encoding despite DB dedup check failure.
+	resp, err := svc.Encode(context.Background(), &EncodeRequest{
+		Content:    "discovered critical memory leak in goroutine pool management",
+		Importance: 0.8,
+	})
+	if err != nil {
+		t.Fatal("DB dedup error should not block encoding:", err)
+	}
+	if !resp.Encoded {
+		t.Error("expected Encoded=true when dedup check fails gracefully")
 	}
 }
 

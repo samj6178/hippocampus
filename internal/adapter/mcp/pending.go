@@ -7,6 +7,11 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	maxPendingTasks = 500
+	pendingTaskTTL  = 24 * time.Hour
+)
+
 type PendingTask struct {
 	ID        string         `json:"task_id"`
 	Type      string         `json:"type"` // "synthesize", "generate_rule"
@@ -31,8 +36,16 @@ func (s *PendingTaskStore) Add(task *PendingTask) {
 	}
 	task.CreatedAt = time.Now()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupExpiredLocked()
+
+	// Evict oldest if at capacity
+	if len(s.tasks) >= maxPendingTasks {
+		s.evictOldestLocked()
+	}
+
 	s.tasks[task.ID] = task
-	s.mu.Unlock()
 }
 
 func (s *PendingTaskStore) Get(id string) (*PendingTask, bool) {
@@ -62,4 +75,31 @@ func (s *PendingTaskStore) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.tasks)
+}
+
+// cleanupExpiredLocked removes tasks older than pendingTaskTTL.
+// Caller must hold s.mu write lock.
+func (s *PendingTaskStore) cleanupExpiredLocked() {
+	cutoff := time.Now().Add(-pendingTaskTTL)
+	for id, t := range s.tasks {
+		if t.CreatedAt.Before(cutoff) {
+			delete(s.tasks, id)
+		}
+	}
+}
+
+// evictOldestLocked removes the single oldest task.
+// Caller must hold s.mu write lock.
+func (s *PendingTaskStore) evictOldestLocked() {
+	var oldestID string
+	var oldestTime time.Time
+	for id, t := range s.tasks {
+		if oldestID == "" || t.CreatedAt.Before(oldestTime) {
+			oldestID = id
+			oldestTime = t.CreatedAt
+		}
+	}
+	if oldestID != "" {
+		delete(s.tasks, oldestID)
+	}
 }

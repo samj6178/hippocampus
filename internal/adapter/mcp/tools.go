@@ -106,6 +106,10 @@ func tools() []map[string]any {
 						"type":        "integer",
 						"description": "Maximum tokens for assembled context. Default 4096.",
 					},
+					"room": map[string]any{
+						"type":        "string",
+						"description": "Filter by topic room: architecture, database, api, testing, deployment, security, performance, bugs, decisions, dependencies. Omit to search all rooms.",
+					},
 				},
 				"required": []string{"query"},
 			},
@@ -202,7 +206,11 @@ func tools() []map[string]any {
 				"properties": map[string]any{
 					"summary": map[string]any{
 						"type":        "string",
-						"description": "Summary of what was accomplished in this session: decisions made, code changed, problems solved, next steps.",
+						"description": "Summary of what was accomplished in this session: decisions made, code changed, problems solved.",
+					},
+					"next_steps": map[string]any{
+						"type":        "string",
+						"description": "What remains to be done. The next session will see this in auto_context so the agent can continue seamlessly.",
 					},
 					"project": map[string]any{
 						"type":        "string",
@@ -513,6 +521,79 @@ func tools() []map[string]any {
 					"result":  map[string]any{"type": "string", "description": "The LLM-generated result text"},
 				},
 				"required": []string{"task_id", "result"},
+			},
+		},
+		// --- Conversation Mining ---
+		{
+			"name":        "mos_mine_conversations",
+			"description": "Extract valuable memories from past Claude Code session transcripts. Scans JSONL session files, finds exchanges containing decisions, errors, and architecture discussions, and stores them as memories. Run once per project to bootstrap memory from conversation history.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"sessions_dir": map[string]any{
+						"type":        "string",
+						"description": "Path to Claude Code sessions directory (e.g. ~/.claude/projects/my-project/). If omitted, auto-detects from active project.",
+					},
+					"project": map[string]any{
+						"type":        "string",
+						"description": "Project slug. Omit to use active project.",
+					},
+				},
+			},
+		},
+		// --- Knowledge Graph ---
+		{
+			"name":        "mos_kg_add",
+			"description": "Add a fact to the temporal knowledge graph. Facts have validity windows and can be invalidated (soft-deleted) when they become outdated. Use for recording relationships between entities: 'service X uses technology Y', 'module A depends on B'.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"subject":    map[string]any{"type": "string", "description": "The entity this fact is about (e.g. 'consolidate_service', 'auth_middleware')."},
+					"predicate":  map[string]any{"type": "string", "description": "The relationship (e.g. 'uses', 'depends_on', 'replaced_by', 'implements')."},
+					"object":     map[string]any{"type": "string", "description": "The target entity (e.g. 'sqlite', 'jwt', 'clean_architecture')."},
+					"confidence": map[string]any{"type": "number", "description": "Confidence 0.0-1.0. Default 1.0."},
+					"project":    map[string]any{"type": "string", "description": "Project slug. Omit to use active project."},
+				},
+				"required": []string{"subject", "predicate", "object"},
+			},
+		},
+		{
+			"name":        "mos_kg_query",
+			"description": "Query the knowledge graph for facts about an entity. Returns current facts by default, or facts valid at a specific point in time (as_of parameter). Searches both outgoing (entity as subject) and incoming (entity as object) relationships.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"entity":  map[string]any{"type": "string", "description": "Entity name to query (e.g. 'consolidate_service')."},
+					"as_of":   map[string]any{"type": "string", "description": "ISO 8601 timestamp for point-in-time query. Omit for current facts."},
+					"project": map[string]any{"type": "string", "description": "Project slug. Omit to use active project."},
+				},
+				"required": []string{"entity"},
+			},
+		},
+		{
+			"name":        "mos_kg_invalidate",
+			"description": "Soft-delete a fact by setting its end date. The fact is not removed — it becomes historical, queryable via as_of parameter or timeline. Use when a fact is no longer true (e.g. after a refactoring, migration, or technology change).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"subject":   map[string]any{"type": "string", "description": "Subject entity."},
+					"predicate": map[string]any{"type": "string", "description": "Relationship."},
+					"object":    map[string]any{"type": "string", "description": "Object entity."},
+					"project":   map[string]any{"type": "string", "description": "Project slug. Omit to use active project."},
+				},
+				"required": []string{"subject", "predicate", "object"},
+			},
+		},
+		{
+			"name":        "mos_kg_timeline",
+			"description": "Get the full history of an entity: all facts (including expired) ordered chronologically. Shows how knowledge about an entity evolved over time.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"entity":  map[string]any{"type": "string", "description": "Entity name to get timeline for."},
+					"project": map[string]any{"type": "string", "description": "Project slug. Omit to use active project."},
+				},
+				"required": []string{"entity"},
 			},
 		},
 	}

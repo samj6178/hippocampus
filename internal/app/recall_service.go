@@ -13,6 +13,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/hippocampus-mcp/hippocampus/internal/pkg/roomclass"
+
 	"github.com/google/uuid"
 	"github.com/hippocampus-mcp/hippocampus/internal/domain"
 	"github.com/hippocampus-mcp/hippocampus/internal/memory"
@@ -39,6 +41,12 @@ type RecallService struct {
 	weights          ScoreWeights
 	ollamaBaseURL    string
 	translationModel string
+
+	// Configurable thresholds for relevance detection.
+	absoluteFloor  float64
+	entropyBest    float64
+	kwCheckThresh  float64
+	kwAcceptThresh float64
 }
 
 func (s *RecallService) SetCausalDetector(cd *CausalDetector) {
@@ -72,6 +80,12 @@ type RecallServiceConfig struct {
 	Weights           ScoreWeights
 	OllamaBaseURL     string // for query translation, e.g. "http://localhost:11434"
 	TranslationModel  string // e.g. "qwen2.5:7b"
+
+	// Relevance detection thresholds (configurable via config.json > memory.recall).
+	AbsoluteFloor  float64 // Min similarity to consider relevant (default 0.30)
+	EntropyBest    float64 // Max best_sim for entropy rejection (default 0.45)
+	KWCheckThresh  float64 // Below this, require keyword overlap (default 0.60)
+	KWAcceptThresh float64 // Semantic sim that bypasses keyword check (default 0.43)
 }
 
 func NewRecallService(
@@ -115,15 +129,27 @@ func NewRecallService(
 		weights:          w,
 		ollamaBaseURL:    ollamaURL,
 		translationModel: transModel,
+		absoluteFloor:    orDefault(cfg.AbsoluteFloor, 0.30),
+		entropyBest:      orDefault(cfg.EntropyBest, 0.45),
+		kwCheckThresh:    orDefault(cfg.KWCheckThresh, 0.60),
+		kwAcceptThresh:   orDefault(cfg.KWAcceptThresh, 0.43),
 	}
 }
 
+func orDefault(v, def float64) float64 {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
 type RecallRequest struct {
-	Query      string         `json:"query"`
-	ProjectID  *uuid.UUID     `json:"project_id,omitempty"`
-	Budget     domain.TokenBudget `json:"budget"`
-	AgentID    string         `json:"agent_id"`
-	IncludeGlobal bool       `json:"include_global"`
+	Query         string             `json:"query"`
+	ProjectID     *uuid.UUID         `json:"project_id,omitempty"`
+	Budget        domain.TokenBudget `json:"budget"`
+	AgentID       string             `json:"agent_id"`
+	IncludeGlobal bool               `json:"include_global"`
+	Room          string             `json:"room,omitempty"`
 }
 
 type RecallResponse struct {
@@ -185,6 +211,11 @@ func (s *RecallService) Recall(ctx context.Context, req *RecallRequest) (*Recall
 		if err == nil {
 			candidates = dedup(append(candidates, origCandidates...))
 		}
+	}
+
+	// Room filter: narrow candidates to a specific topic area when requested.
+	if req.Room != "" {
+		candidates = filterByRoom(candidates, req.Room)
 	}
 
 	// Query expansion: generate an alternative phrasing to catch synonyms
@@ -440,10 +471,16 @@ func (s *RecallService) scoreAll(candidates []*domain.MemoryItem, queryEmb []flo
 			}
 		}
 
-		composite := s.weights.Semantic*sim +
-			s.weights.Keyword*kwScore +
-			s.weights.Recency*recency +
-			s.weights.Explicit*mem.Importance
+		var composite float64
+		if len(queryEmb) == 0 {
+			// BM25-only mode: redistribute semantic weight to keyword + importance.
+			composite = 0.45*kwScore + 0.25*recency + 0.30*mem.Importance
+		} else {
+			composite = s.weights.Semantic*sim +
+				s.weights.Keyword*kwScore +
+				s.weights.Recency*recency +
+				s.weights.Explicit*mem.Importance
+		}
 
 		// Temporal boost: if query mentions a time range ("last week", "yesterday"),
 		// memories created within that range get a score boost.
@@ -519,6 +556,26 @@ func (s *RecallService) filterWeakCandidates(scored []*domain.ScoredMemory) []*d
 	if len(scored) == 0 {
 		return scored
 	}
+
+	// BM25-only mode: skip semantic similarity filtering, use composite score instead.
+	if s.embedding == nil || s.embedding.Dimensions() == 0 {
+		if len(scored) <= 1 {
+			return scored
+		}
+		bestComposite := scored[0].Score.Composite
+		cutoff := bestComposite * 0.5
+		filtered := make([]*domain.ScoredMemory, 0, len(scored))
+		for _, sm := range scored {
+			if sm.Memory.Tier == domain.TierWorking || sm.Score.Composite >= cutoff {
+				filtered = append(filtered, sm)
+			}
+		}
+		if len(filtered) == 0 {
+			return scored
+		}
+		return filtered
+	}
+
 	var maxSim float64
 	for _, sm := range scored {
 		if sm.Score.SemanticSimilarity > maxSim {
@@ -754,9 +811,24 @@ func (s *RecallService) detectIrrelevantQuery(scored []*domain.ScoredMemory, ori
 
 	bestSim := scored[0].Score.SemanticSimilarity
 
-	const absoluteFloor = 0.35
-	if bestSim < absoluteFloor {
-		return true, fmt.Sprintf("below_absolute_floor(%.3f < %.3f)", bestSim, absoluteFloor)
+	// BM25-only mode: when no embeddings are available, SemanticSimilarity is 0
+	// for all candidates. Skip similarity-based rejection entirely and rely on
+	// keyword overlap + composite score instead.
+	bm25Only := s.embedding == nil || s.embedding.Dimensions() == 0
+	if bm25Only {
+		bestComposite := scored[0].Score.Composite
+		if bestComposite < 0.15 {
+			return true, fmt.Sprintf("bm25_only_weak_composite(%.3f)", bestComposite)
+		}
+		// In BM25-only mode, trust keyword matches
+		if scored[0].Score.KeywordRelevance > 0 {
+			return false, ""
+		}
+		return bestComposite < 0.20, fmt.Sprintf("bm25_only_low_composite(%.3f)", bestComposite)
+	}
+
+	if bestSim < s.absoluteFloor {
+		return true, fmt.Sprintf("below_absolute_floor(%.3f < %.3f)", bestSim, s.absoluteFloor)
 	}
 
 	// BM25 fast path: if a top candidate was found by keyword search (BM25),
@@ -782,14 +854,26 @@ func (s *RecallService) detectIrrelevantQuery(scored []*domain.ScoredMemory, ori
 	if topN > n {
 		topN = n
 	}
+	// Statistical rejection: high entropy means all candidates score similarly
+	// (nothing stands out). Combined with low absolute similarity, this suggests
+	// the query is unrelated to stored memories.
+	// Thresholds tuned for nomic-embed-text (768d): good matches typically 0.4-0.7.
+	// OpenAI ada-002/3-small (1536d): good matches 0.6-0.95.
+	entropyBestThreshold := s.entropyBest
+	spreadBestThreshold := s.entropyBest
+	if s.embedding != nil && s.embedding.Dimensions() >= 1024 {
+		entropyBestThreshold = s.entropyBest + 0.10
+		spreadBestThreshold = s.entropyBest + 0.10
+	}
+
 	if topN >= 5 {
 		sims := make([]float64, topN)
 		for i := 0; i < topN; i++ {
 			sims[i] = scored[i].Score.SemanticSimilarity
 		}
 		entropy := normalizedEntropy(sims)
-		if entropy > 0.92 && bestSim < 0.55 {
-			if !hasProjectMemoryInTop(scored, projectID, 5, 0.46) {
+		if entropy > 0.95 && bestSim < entropyBestThreshold {
+			if !hasProjectMemoryInTop(scored, projectID, 5, 0.38) {
 				return true, fmt.Sprintf("high_entropy(H=%.3f, best=%.3f)", entropy, bestSim)
 			}
 		}
@@ -798,14 +882,24 @@ func (s *RecallService) detectIrrelevantQuery(scored []*domain.ScoredMemory, ori
 	if n >= 3 {
 		thirdSim := scored[2].Score.SemanticSimilarity
 		spread := bestSim - thirdSim
-		if spread < 0.025 && bestSim < 0.55 {
-			if !hasProjectMemoryInTop(scored, projectID, 5, 0.46) {
+		if spread < 0.02 && bestSim < spreadBestThreshold {
+			if !hasProjectMemoryInTop(scored, projectID, 5, 0.38) {
 				return true, fmt.Sprintf("flat_spread(spread=%.4f, best=%.3f)", spread, bestSim)
 			}
 		}
 	}
 
-	if bestSim < 0.72 {
+	// Keyword overlap check: for medium-similarity results, verify that query
+	// keywords appear in top candidates. This catches false positive semantic matches.
+	// Threshold adapted to embedding model dimension (lower-dim = lower similarities).
+	kwCheckThreshold := s.kwCheckThresh
+	kwAcceptThreshold := s.kwAcceptThresh
+	if s.embedding != nil && s.embedding.Dimensions() >= 1024 {
+		kwCheckThreshold = s.kwCheckThresh + 0.12
+		kwAcceptThreshold = s.kwAcceptThresh + 0.07
+	}
+
+	if bestSim < kwCheckThreshold {
 		topCheck := 5
 		if topCheck > n {
 			topCheck = n
@@ -813,7 +907,12 @@ func (s *RecallService) detectIrrelevantQuery(scored []*domain.ScoredMemory, ori
 		queryKWCount := countQueryKeywords(originalQuery)
 		topFromProject := topMemoryFromProject(scored, projectID)
 
-		if topFromProject && queryKWCount <= 2 && bestSim >= 0.44 {
+		if topFromProject && queryKWCount <= 2 && bestSim >= kwAcceptThreshold {
+			return false, ""
+		}
+
+		// With decent semantic match, relax keyword requirement.
+		if bestSim >= kwAcceptThreshold+0.05 {
 			return false, ""
 		}
 
@@ -1323,6 +1422,26 @@ func dedup(items []*domain.MemoryItem) []*domain.MemoryItem {
 		}
 	}
 	return result
+}
+
+// filterByRoom keeps only candidates that have the matching room:XXX tag.
+// If the filter produces zero results, returns the original list to avoid
+// empty recalls when rooms are misclassified.
+func filterByRoom(items []*domain.MemoryItem, room string) []*domain.MemoryItem {
+	tag := roomclass.Tag(room)
+	var filtered []*domain.MemoryItem
+	for _, item := range items {
+		for _, t := range item.Tags {
+			if t == tag {
+				filtered = append(filtered, item)
+				break
+			}
+		}
+	}
+	if len(filtered) == 0 {
+		return items // graceful fallback: don't return empty
+	}
+	return filtered
 }
 
 // refreshAccessed boosts importance of recalled memories by a small factor,

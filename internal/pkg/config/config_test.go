@@ -22,12 +22,12 @@ func TestValidate_Database(t *testing.T) {
 		mutate func(*Config)
 		errMsg string
 	}{
-		{"empty_host", func(c *Config) { c.Database.Host = "" }, "database.host"},
-		{"zero_port", func(c *Config) { c.Database.Port = 0 }, "database.port"},
-		{"port_too_high", func(c *Config) { c.Database.Port = 70000 }, "database.port"},
-		{"empty_dbname", func(c *Config) { c.Database.DBName = "" }, "database.db_name"},
-		{"zero_maxconns", func(c *Config) { c.Database.MaxConns = 0 }, "database.max_conns"},
-		{"negative_maxconns", func(c *Config) { c.Database.MaxConns = -1 }, "database.max_conns"},
+		{"empty_host", func(c *Config) { c.Database.Driver = "postgres"; c.Database.Host = "" }, "database.host"},
+		{"zero_port", func(c *Config) { c.Database.Driver = "postgres"; c.Database.Port = 0 }, "database.port"},
+		{"port_too_high", func(c *Config) { c.Database.Driver = "postgres"; c.Database.Port = 70000 }, "database.port"},
+		{"empty_dbname", func(c *Config) { c.Database.Driver = "postgres"; c.Database.DBName = "" }, "database.db_name"},
+		{"zero_maxconns", func(c *Config) { c.Database.Driver = "postgres"; c.Database.MaxConns = 0 }, "database.max_conns"},
+		{"negative_maxconns", func(c *Config) { c.Database.Driver = "postgres"; c.Database.MaxConns = -1 }, "database.max_conns"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -75,10 +75,10 @@ func TestValidate_Embedding(t *testing.T) {
 		mutate func(*Config)
 		errMsg string
 	}{
-		{"empty_base_url", func(c *Config) { c.OpenAI.BaseURL = "" }, "openai.base_url"},
-		{"empty_model", func(c *Config) { c.OpenAI.Model = "" }, "openai.model"},
-		{"zero_dimensions", func(c *Config) { c.OpenAI.Dimensions = 0 }, "openai.dimensions"},
-		{"zero_max_batch", func(c *Config) { c.OpenAI.MaxBatch = 0 }, "openai.max_batch"},
+		{"empty_base_url", func(c *Config) { c.OpenAI.Mode = "ollama"; c.OpenAI.BaseURL = "" }, "openai.base_url"},
+		{"empty_model", func(c *Config) { c.OpenAI.Mode = "ollama"; c.OpenAI.Model = "" }, "openai.model"},
+		{"zero_dimensions", func(c *Config) { c.OpenAI.Mode = "ollama"; c.OpenAI.Dimensions = 0 }, "openai.dimensions"},
+		{"zero_max_batch", func(c *Config) { c.OpenAI.Mode = "ollama"; c.OpenAI.MaxBatch = 0 }, "openai.max_batch"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -151,8 +151,10 @@ func TestValidate_Memory(t *testing.T) {
 
 func TestValidate_MultipleErrors(t *testing.T) {
 	cfg := validConfig()
+	cfg.Database.Driver = "postgres"
 	cfg.Database.Host = ""
 	cfg.Database.DBName = ""
+	cfg.OpenAI.Mode = "ollama"
 	cfg.OpenAI.Model = ""
 	err := cfg.Validate()
 	if err == nil {

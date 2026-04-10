@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/hippocampus-mcp/hippocampus/internal/pkg/roomclass"
 )
 
 const maxSummaryLen = 200
@@ -254,6 +256,12 @@ func extractAutoTags(content string) []string {
 				break
 			}
 		}
+	}
+
+	// Auto-classify room and add as tag for structured navigation.
+	room := roomclass.Classify(content)
+	if room != roomclass.RoomGeneral {
+		add(roomclass.Tag(room))
 	}
 
 	return tags

@@ -130,9 +130,17 @@ func (pa *PreventionAnalyzer) Analyze(ctx context.Context, warnings []MatchedWar
 // gitDiff returns map[normalizedFilePath]diffContent.
 // If baseCommit is non-empty, runs `git diff <baseCommit>` to capture all changes since session start.
 // Otherwise falls back to `git diff HEAD` (uncommitted changes only).
+// validGitRef matches a hex commit hash (7-40 chars) or literal "HEAD".
+var validGitRef = regexp.MustCompile(`^([0-9a-f]{7,40}|HEAD)$`)
+
 func gitDiff(ctx context.Context, projectRoot string, baseCommit string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+
+	// Security: validate baseCommit to prevent command injection via git args
+	if baseCommit != "" && !validGitRef.MatchString(baseCommit) {
+		return nil, fmt.Errorf("invalid git ref: %q", baseCommit)
+	}
 
 	args := []string{"diff"}
 	if baseCommit != "" {
