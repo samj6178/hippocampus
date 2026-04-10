@@ -1,60 +1,67 @@
+###############################################################################
+# Hippocampus MOS — One-command setup: docker compose up
+#
+# Services:
+#   ollama       — Local embedding model (nomic-embed-text, 274MB)
+#   hippocampus  — Memory system (SQLite, MCP + REST)
+#
+# First run pulls the model automatically (~2 min on fast internet).
+# Data persisted in named volumes — survives docker compose down.
+###############################################################################
+
 services:
-  timescaledb:
-    image: timescale/timescaledb-ha:pg16
+  ollama:
+    image: ollama/ollama:latest
     ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: hippocampus
-      POSTGRES_USER: mos
-      POSTGRES_PASSWORD: mos
+      - "11434:11434"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ollama_data:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mos -d hippocampus"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # Pull the embedding model on first start. Exits 0 when done.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["ollama", "pull", "nomic-embed-text"]
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    restart: "no"
 
   hippocampus:
     build: .
     ports:
       - "8080:8080"
       - "9090:9090"
-      - "3000:3000"
     environment:
-      DATABASE_URL: "postgres://mos:mos@timescaledb:5432/hippocampus?sslmode=disable"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
       LOG_LEVEL: "info"
+    volumes:
+      - hippocampus_data:/data
     depends_on:
-      timescaledb:
+      ollama:
         condition: service_healthy
-
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9091:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    depends_on:
-      - hippocampus
-
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3001:3000"
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: hippocampus
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
-    depends_on:
-      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
 volumes:
-  pgdata:
-  prometheus_data:
-  grafana_data:
+  ollama_data:
+  hippocampus_data:
